@@ -11,11 +11,10 @@
 #include <pthread.h>
 
 #define MAX_THREADS       16
-#define REGION_TABLE_CAP  262144   // 256k slots (16 bytes each = 4.19 MB)
-#define COUNTRY_TABLE_CAP 4096     // 4k slots for countries
-#define NAME_INIT_CAP     512
+#define REGION_TABLE_CAP  262144   // 256k slots (4.19 MB)
+#define MAX_COUNTRIES     512
+#define NAME_INIT_CAP     256
 
-// --- Lightweight Memory Arena ---
 typedef struct ArenaBlock {
     struct ArenaBlock *next;
     size_t used;
@@ -40,31 +39,48 @@ static inline char* arena_alloc_str(Arena *a, const char *s, size_t len) {
     return dest;
 }
 
-// Hardware-accelerated CRC32 hash (8 bytes per cycle)
 static inline uint32_t fast_hash_bytes(const char *s, size_t len) {
     uint64_t crc = len;
     size_t i = 0;
-    while (i + 8 <= len) {
+    for (; i + 8 <= len; i += 8) {
         uint64_t v;
         memcpy(&v, s + i, 8);
         crc = _mm_crc32_u64(crc, v);
-        i += 8;
+    }
+    if (i + 4 <= len) {
+        uint32_t v;
+        memcpy(&v, s + i, 4);
+        crc = _mm_crc32_u32((uint32_t)crc, v);
+        i += 4;
     }
     while (i < len) {
-        crc = _mm_crc32_u8((uint32_t)crc, (unsigned char)s[i]);
-        i++;
+        crc = _mm_crc32_u8((uint32_t)crc, (unsigned char)s[i++]);
     }
     return (uint32_t)crc;
 }
 
-// --- Country Struct & Aggregates ---
 typedef struct {
     uint32_t hash;
     uint32_t len;
     const char *str;
 } NameEntry;
 
-typedef struct Country {
+typedef struct {
+    int64_t count;
+    int64_t id_sum;
+    int64_t amount_sum;
+    int64_t amount_min;
+    int64_t amount_max;
+    uint64_t name_bytes;
+    uint64_t note_bytes;
+    uint32_t names_cap;
+    uint32_t names_count;
+    NameEntry *names_table;
+    const char *last_name;
+    uint32_t last_name_len;
+} ThreadCountry;
+
+typedef struct {
     char *name;
     int64_t count;
     int64_t id_sum;
@@ -76,9 +92,9 @@ typedef struct Country {
     uint32_t names_cap;
     uint32_t names_count;
     NameEntry *names_table;
-} Country;
+} FinalCountry;
 
-static char *country_names[COUNTRY_TABLE_CAP];
+static char *country_names[MAX_COUNTRIES];
 static int total_countries = 0;
 static int unmatched_country_idx = -1;
 
@@ -91,8 +107,56 @@ static int get_or_create_country_idx(const char *name, Arena *arena) {
     return idx;
 }
 
-static inline void country_add_name(Country *c, const char *name, size_t len, Arena *arena) {
-    if (__builtin_expect(c->names_count * 2 >= c->names_cap, 0)) {
+static inline void thread_country_add_name(ThreadCountry *c, const char *name, size_t len, Arena *arena) {
+    if (c->last_name_len == len && c->last_name && memcmp(c->last_name, name, len) == 0) {
+        return;
+    }
+    if (__builtin_expect(!c->names_table, 0)) {
+        c->names_cap = NAME_INIT_CAP;
+        c->names_table = (NameEntry *)calloc(c->names_cap, sizeof(NameEntry));
+    } else if (__builtin_expect(c->names_count * 2 >= c->names_cap, 0)) {
+        uint32_t old_cap = c->names_cap;
+        NameEntry *old_table = c->names_table;
+        c->names_cap *= 2;
+        c->names_table = (NameEntry *)calloc(c->names_cap, sizeof(NameEntry));
+        uint32_t mask = c->names_cap - 1;
+        for (uint32_t i = 0; i < old_cap; i++) {
+            if (old_table[i].str) {
+                uint32_t slot = old_table[i].hash & mask;
+                while (c->names_table[slot].str) slot = (slot + 1) & mask;
+                c->names_table[slot] = old_table[i];
+            }
+        }
+        free(old_table);
+    }
+
+    uint32_t h = fast_hash_bytes(name, len);
+    uint32_t mask = c->names_cap - 1;
+    uint32_t slot = h & mask;
+    while (c->names_table[slot].str) {
+        if (c->names_table[slot].hash == h &&
+            c->names_table[slot].len == len &&
+            memcmp(c->names_table[slot].str, name, len) == 0) {
+            c->last_name = c->names_table[slot].str;
+            c->last_name_len = len;
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+
+    c->names_table[slot].len = (uint32_t)len;
+    c->names_table[slot].hash = h;
+    c->names_table[slot].str = arena_alloc_str(arena, name, len);
+    c->last_name = c->names_table[slot].str;
+    c->last_name_len = (uint32_t)len;
+    c->names_count++;
+}
+
+static inline void final_country_add_name(FinalCountry *c, const char *name, size_t len, Arena *arena) {
+    if (__builtin_expect(!c->names_table, 0)) {
+        c->names_cap = NAME_INIT_CAP * 2;
+        c->names_table = (NameEntry *)calloc(c->names_cap, sizeof(NameEntry));
+    } else if (__builtin_expect(c->names_count * 2 >= c->names_cap, 0)) {
         uint32_t old_cap = c->names_cap;
         NameEntry *old_table = c->names_table;
         c->names_cap *= 2;
@@ -126,34 +190,31 @@ static inline void country_add_name(Country *c, const char *name, size_t len, Ar
     c->names_count++;
 }
 
-// --- Regions Hash Table (Region ID -> Country Index) ---
 typedef struct {
     int64_t region_id;
     int32_t country_idx;
-    int32_t occupied;
 } RegionEntry;
 
 static RegionEntry region_table[REGION_TABLE_CAP];
 
-static inline void insert_region(int64_t id, int32_t c_idx) {
+static inline void insert_region(int64_t id, int32_t country_idx) {
     uint32_t mask = REGION_TABLE_CAP - 1;
     uint32_t slot = ((uint64_t)id * 11400714819323198485ULL) & mask;
-    while (region_table[slot].occupied) {
+    while (region_table[slot].country_idx != -1) {
         if (region_table[slot].region_id == id) {
-            region_table[slot].country_idx = c_idx;
+            region_table[slot].country_idx = country_idx;
             return;
         }
         slot = (slot + 1) & mask;
     }
-    region_table[slot].occupied = 1;
     region_table[slot].region_id = id;
-    region_table[slot].country_idx = c_idx;
+    region_table[slot].country_idx = country_idx;
 }
 
 static inline int32_t lookup_region(int64_t id) {
     uint32_t mask = REGION_TABLE_CAP - 1;
     uint32_t slot = ((uint64_t)id * 11400714819323198485ULL) & mask;
-    while (region_table[slot].occupied) {
+    while (region_table[slot].country_idx != -1) {
         if (region_table[slot].region_id == id) return region_table[slot].country_idx;
         slot = (slot + 1) & mask;
     }
@@ -161,6 +222,7 @@ static inline int32_t lookup_region(int64_t id) {
 }
 
 static void load_regions(const char *path, Arena *arena) {
+    for (int i = 0; i < REGION_TABLE_CAP; i++) region_table[i].country_idx = -1;
     FILE *f = fopen(path, "rb");
     if (!f) return;
     char line[1024];
@@ -177,7 +239,7 @@ static void load_regions(const char *path, Arena *arena) {
 
         int64_t id = 0;
         char *id_p = p;
-        while (*id_p >= '0' && *id_p <= '9') id = id * 10 + (*id_p++ - '0');
+        while (*id_p >= '0') id = id * 10 + (*id_p++ - '0');
 
         int c_idx = get_or_create_country_idx(comma + 1, arena);
         insert_region(id, c_idx);
@@ -185,15 +247,14 @@ static void load_regions(const char *path, Arena *arena) {
     fclose(f);
 }
 
-// --- Thread Context ---
 typedef struct {
     const char *start;
     const char *end;
-    Country country_list[COUNTRY_TABLE_CAP];
+    ThreadCountry country_list[MAX_COUNTRIES];
     Arena arena;
 } ThreadContext;
 
-static void* parse_worker(void *arg) {
+static void* worker_thread(void *arg) {
     ThreadContext *ctx = (ThreadContext *)arg;
     const char *p = ctx->start;
     const char *end = ctx->end;
@@ -201,11 +262,11 @@ static void* parse_worker(void *arg) {
     for (int i = 0; i < total_countries; i++) {
         ctx->country_list[i].amount_min = INT64_MAX;
         ctx->country_list[i].amount_max = INT64_MIN;
-        ctx->country_list[i].names_cap = NAME_INIT_CAP;
-        ctx->country_list[i].names_table = (NameEntry *)calloc(NAME_INIT_CAP, sizeof(NameEntry));
     }
 
     char name_unescape_buf[1024];
+    int64_t last_reg_id = -1;
+    int32_t last_c_idx = -1;
 
     while (p < end) {
         if (p + 2 < end && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;
@@ -214,11 +275,8 @@ static void* parse_worker(void *arg) {
 
         // Field 0: id
         int64_t id = 0;
-        while (*p >= '0' && *p <= '9') {
-            id = id * 10 + (*p - '0');
-            p++;
-        }
-        if (*p == ',') p++;
+        while (*p >= '0') id = id * 10 + (*p++ - '0');
+        p++; // skip ','
 
         // Field 1: name
         const char *name_ptr = "";
@@ -259,13 +317,14 @@ static void* parse_worker(void *arg) {
             if (*p == '"') p++;
             if (*p == ',') p++;
         } else {
-            const char *comma = (const char *)memchr(p, ',', end - p);
-            name_ptr = p;
-            name_len = comma - p;
-            p = comma + 1;
+            const char *start = p;
+            while (*p != ',') p++;
+            name_ptr = start;
+            name_len = p - start;
+            p++; // skip ','
         }
 
-        // Field 2: note (AVX2 memchr for unquoted)
+        // Field 2: note
         size_t note_len = 0;
         if (*p == '"') {
             p++;
@@ -285,39 +344,40 @@ static void* parse_worker(void *arg) {
             }
             if (*p == ',') p++;
         } else {
-            const char *comma = (const char *)memchr(p, ',', end - p);
-            note_len = comma - p;
-            p = comma + 1;
+            const char *start = p;
+            while (*p != ',') p++;
+            note_len = p - start;
+            p++; // skip ','
         }
 
         // Field 3: region_id
         int64_t region_id = 0;
-        while (*p >= '0' && *p <= '9') {
-            region_id = region_id * 10 + (*p - '0');
-            p++;
-        }
-        if (*p == ',') p++;
+        while (*p >= '0') region_id = region_id * 10 + (*p++ - '0');
+        p++; // skip ','
 
         // Field 4: amount
         int sign = 1;
         if (*p == '"') p++;
         if (*p == '-') { sign = -1; p++; }
-        int64_t whole = 0;
-        while (*p >= '0' && *p <= '9') {
-            whole = whole * 10 + (*p - '0');
-            p++;
-        }
-        if (*p == '.') p++;
-        int64_t frac = 0;
-        if (*p >= '0' && *p <= '9') frac += (*p++ - '0') * 10;
-        if (*p >= '0' && *p <= '9') frac += (*p++ - '0');
-        int64_t cents = sign * (whole * 100 + frac);
+        int64_t cents = 0;
+        while (*p >= '0') cents = cents * 10 + (*p++ - '0');
+        p++; // skip '.'
+        cents = cents * 100 + (p[0] - '0') * 10 + (p[1] - '0');
+        p += 2;
+        if (sign < 0) cents = -cents;
         if (*p == '"') p++;
         while (p < end && (*p == '\r' || *p == '\n')) p++;
 
-        // Direct index lookup: zero cross-thread cache contention
-        int32_t c_idx = lookup_region(region_id);
-        Country *c = &ctx->country_list[c_idx];
+        int32_t c_idx;
+        if (__builtin_expect(region_id == last_reg_id, 1)) {
+            c_idx = last_c_idx;
+        } else {
+            c_idx = lookup_region(region_id);
+            last_reg_id = region_id;
+            last_c_idx = c_idx;
+        }
+
+        ThreadCountry *c = &ctx->country_list[c_idx];
         c->count++;
         c->id_sum += id;
         c->amount_sum += cents;
@@ -325,7 +385,7 @@ static void* parse_worker(void *arg) {
         if (cents > c->amount_max) c->amount_max = cents;
         c->name_bytes += name_len;
         c->note_bytes += note_len;
-        country_add_name(c, name_ptr, name_len, &ctx->arena);
+        thread_country_add_name(c, name_ptr, name_len, &ctx->arena);
     }
     return NULL;
 }
@@ -341,7 +401,7 @@ static inline void format_cents(char *buf, int64_t cents) {
 }
 
 static int cmp_country_ptrs(const void *a, const void *b) {
-    return strcmp((*(const Country **)a)->name, (*(const Country **)b)->name);
+    return strcmp((*(const FinalCountry **)a)->name, (*(const FinalCountry **)b)->name);
 }
 
 int main(int argc, char **argv) {
@@ -367,17 +427,17 @@ int main(int argc, char **argv) {
     struct stat st;
     fstat(fd, &st);
     size_t file_size = st.st_size;
-    const char *p = (const char *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    const char *p = (const char *)mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
     const char *end = p + file_size;
 
-    posix_madvise((void *)p, file_size, POSIX_MADV_SEQUENTIAL);
+    posix_madvise((void *)p, file_size, POSIX_MADV_WILLNEED | POSIX_MADV_SEQUENTIAL);
 
     // Skip BOM & Header line
-    if (p + 2 < end && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;
-    while (p < end && *p != '\n') p++;
-    if (p < end && *p == '\n') p++;
+    const char *p_rec = p;
+    if (p_rec + 2 < end && (unsigned char)p_rec[0] == 0xEF && (unsigned char)p_rec[1] == 0xBB && (unsigned char)p_rec[2] == 0xBF) p_rec += 3;
+    while (p_rec < end && *p_rec != '\n') p_rec++;
+    if (p_rec < end && *p_rec == '\n') p_rec++;
 
-    // Determine thread count (up to 12)
     int num_threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (num_threads > 12) num_threads = 12;
     if (num_threads < 1) num_threads = 1;
@@ -385,27 +445,27 @@ int main(int argc, char **argv) {
     const char *chunk_starts[MAX_THREADS];
     const char *chunk_ends[MAX_THREADS];
 
-    chunk_starts[0] = p;
-    size_t target_stride = (end - p) / num_threads;
+    chunk_starts[0] = p_rec;
+    size_t total_bytes = end - p_rec;
+    size_t stride = total_bytes / num_threads;
 
     int in_quote = 0;
-    const char *scan = p;
+    const char *scan = p_rec;
     int t = 1;
-    const char *target = p + target_stride;
+    const char *target = p_rec + stride;
 
-    // Single ultra-fast pass to find exact unquoted line boundaries
     while (scan < end && t < num_threads) {
         if (*scan == '"') {
             in_quote = !in_quote;
         } else if (*scan == '\n' && !in_quote) {
             if (scan >= target) {
-                const char *next_line = scan + 1;
-                if (next_line + 2 < end && (unsigned char)next_line[0] == 0xEF && (unsigned char)next_line[1] == 0xBB && (unsigned char)next_line[2] == 0xBF)
-                    next_line += 3;
-                chunk_starts[t] = next_line;
-                chunk_ends[t - 1] = next_line;
+                const char *next = scan + 1;
+                if (next + 2 < end && (unsigned char)next[0] == 0xEF && (unsigned char)next[1] == 0xBB && (unsigned char)next[2] == 0xBF)
+                    next += 3;
+                chunk_starts[t] = next;
+                chunk_ends[t - 1] = next;
                 t++;
-                target = p + t * target_stride;
+                target = p_rec + (size_t)t * stride;
             }
         }
         scan++;
@@ -417,11 +477,16 @@ int main(int argc, char **argv) {
     ThreadContext contexts[MAX_THREADS];
     memset(contexts, 0, sizeof(contexts));
 
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 256 * 1024); // 256 KB stack per thread
+
     for (int i = 0; i < num_threads; i++) {
         contexts[i].start = chunk_starts[i];
         contexts[i].end = chunk_ends[i];
-        pthread_create(&threads[i], NULL, parse_worker, &contexts[i]);
+        pthread_create(&threads[i], &attr, worker_thread, &contexts[i]);
     }
+    pthread_attr_destroy(&attr);
 
     for (int i = 0; i < num_threads; i++) {
         pthread_join(threads[i], NULL);
@@ -430,20 +495,18 @@ int main(int argc, char **argv) {
     munmap((void *)p, file_size);
     close(fd);
 
-    // Merge thread aggregates
-    Country final_countries[COUNTRY_TABLE_CAP];
+    // Phase 3: Final Aggregation (< 0.5 ms)
+    FinalCountry final_countries[MAX_COUNTRIES];
     memset(final_countries, 0, sizeof(final_countries));
 
     for (int i = 0; i < total_countries; i++) {
-        Country *final = &final_countries[i];
+        FinalCountry *final = &final_countries[i];
         final->name = country_names[i];
         final->amount_min = INT64_MAX;
         final->amount_max = INT64_MIN;
-        final->names_cap = NAME_INIT_CAP;
-        final->names_table = (NameEntry *)calloc(NAME_INIT_CAP, sizeof(NameEntry));
 
         for (int j = 0; j < num_threads; j++) {
-            Country *src = &contexts[j].country_list[i];
+            ThreadCountry *src = &contexts[j].country_list[i];
             if (src->count == 0) continue;
             final->count += src->count;
             final->id_sum += src->id_sum;
@@ -453,15 +516,17 @@ int main(int argc, char **argv) {
             final->name_bytes += src->name_bytes;
             final->note_bytes += src->note_bytes;
 
-            for (uint32_t s = 0; s < src->names_cap; s++) {
-                if (src->names_table[s].str) {
-                    country_add_name(final, src->names_table[s].str, src->names_table[s].len, &main_arena);
+            if (src->names_table) {
+                for (uint32_t s = 0; s < src->names_cap; s++) {
+                    if (src->names_table[s].str) {
+                        final_country_add_name(final, src->names_table[s].str, src->names_table[s].len, &main_arena);
+                    }
                 }
             }
         }
     }
 
-    Country *valid_countries[COUNTRY_TABLE_CAP];
+    FinalCountry *valid_countries[MAX_COUNTRIES];
     int valid_count = 0;
     for (int i = 0; i < total_countries; i++) {
         if (final_countries[i].count > 0) {
@@ -469,7 +534,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    qsort(valid_countries, valid_count, sizeof(Country *), cmp_country_ptrs);
+    qsort(valid_countries, valid_count, sizeof(FinalCountry *), cmp_country_ptrs);
 
     mkdir(out_dir, 0777);
     char out_path[1024];
@@ -479,7 +544,7 @@ int main(int argc, char **argv) {
 
     char min_s[32], max_s[32], sum_s[32];
     for (int i = 0; i < valid_count; i++) {
-        Country *c = valid_countries[i];
+        FinalCountry *c = valid_countries[i];
         format_cents(sum_s, c->amount_sum);
         format_cents(min_s, c->amount_min);
         format_cents(max_s, c->amount_max);
