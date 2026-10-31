@@ -134,6 +134,28 @@ Per phase on step 5 (`full`, first run includes the query-file parse):
 scan=0.003, perm=0.045, query=0.45-0.50`. Preprocessing is just under a third of
 the run now, and the queries are half of it.
 
+### Measured and rejected in step 5
+
+- **Batched pops.** Popping 2/4/8 nodes and relaxing them together does raise
+  memory-level parallelism, and it is *wrong*: the batch advances the heap's
+  `last` past the batch minimum, so a key the batch produces can be pushed below
+  `last` and the answer comes out too large (the `tiny` hash moves from
+  `ecaca7...` to `c369ee...`). Caught only by the hash gate.
+- **Early refill in a peek.** Same invariant, same silent corruption. A
+  side-effect-free peek is correct, and measured a wash (0.066-0.069 s vs 0.067 s
+  for 200 full-size queries, best of 5).
+- **Prefetching the next pop's offset and edge block:** 0.064-0.070 s vs
+  0.067 s. Wash.
+- **Dispatching queries in spatial order** so concurrent searches share cache
+  lines: 0.497/0.506 s and 0.537/0.514 s wall vs 0.506/0.514 s — wash.
+- **Morton order over (level, index in level)** to turn BFS rings into 2-D
+  cells: slower (0.083 s vs 0.075 s query) *and* a slower build (0.614 s vs
+  0.395 s), because the BFS order already carries the locality.
+- **`madvise(MADV_HUGEPAGE)` on `tag`/`head`/`edges`:** no change on this box
+  (0.041/0.043/0.042 s, 6 interleaved rounds); the kernel already backs 112 MB of
+  the 177 MB with huge pages without being asked, so there is no TLB win left to
+  take here.
+
 ## Correctness gates run
 
 - `full`, seed 1: `distances.txt` SHA-256
