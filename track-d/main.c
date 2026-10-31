@@ -11,12 +11,14 @@
 #include <stdatomic.h>
 #include <sched.h>
 
+#ifndef PF
+#define PF 4
+#endif
 #define MAX_THREADS 64
 #define MAX_BUILD_THREADS 8
-#define PF 4 /* prefetch distance in the relaxation loops */
 
 /* ------------------------------------------------------------------------- */
-/* Graph storage: CSR of (head, weight) pairs, forward and reverse.          */
+/* Graph storage: CSR of (head, weight) pairs.                               */
 /* ------------------------------------------------------------------------- */
 
 typedef struct {
@@ -124,144 +126,87 @@ static inline HeapNode rh_pop(RadixHeap *h) {
 }
 
 /* ------------------------------------------------------------------------- */
-/* Distance tables.                                                          */
+/* Distance table: one 64-bit word per node holding (epoch << shift) | dist.  */
 /*                                                                           */
 /* A shortest path has at most n-1 edges of weight below 2^32, so every      */
-/* distance (and every candidate) is below n * 2^32. The remaining high bits */
-/* are free to serve as a per-query generation stamp, so "visited in this    */
-/* query?" and "current distance" become one load from one cache line.       */
-/*                                                                           */
-/* Both directions live in the same 16-byte record, so the meeting test in   */
-/* the relaxation loop hits the line already being touched.                  */
+/* distance (and every candidate distance) is below n * 2^32. The remaining  */
+/* high bits are free to use as a per-query generation stamp, which turns    */
+/* "visited in this query?" plus "current distance" into a single load: the  */
+/* neighbour loop touches one cache line per node instead of two.            */
 /* ------------------------------------------------------------------------- */
 
 typedef struct {
-    uint64_t f, b;
-} TagPair;
+    uint64_t *tag;
+    uint64_t mask;
+    int shift;
+    uint32_t epoch;
+    uint32_t epoch_limit; /* stamps run 1..epoch_limit-1, then the table is cleared */
+} DistTable;
 
-/* Number of low bits that hold a distance. */
+/* Number of low bits that hold a distance: every candidate is below
+ * n * 2^32, so that many bits plus one of slack always suffice. */
 static int dist_bits(uint32_t n) {
     uint64_t ub = (uint64_t)n * 4294967296ULL;
-    int d = 64 - __builtin_clzll(ub) + 2; /* +2 for slack */
+    if (ub == 0) ub = 1;
+    int d = 64 - __builtin_clzll(ub) + 1;
     if (d > 62) d = 62;
     return d;
 }
 
 /* ------------------------------------------------------------------------- */
-/* Bidirectional Dijkstra: grow both frontiers and stop as soon as their      */
-/* radii plus the best complete path found so far prove optimality.          */
+/* Dijkstra, stopping when the target is settled.                            */
 /* ------------------------------------------------------------------------- */
 
 static int64_t shortest(uint32_t s, uint32_t t, uint32_t n,
-                        const uint32_t *head, const Edge *fedges,
-                        const uint32_t *rhead, const Edge *redges,
-                        TagPair *tag, int shift, uint32_t *epoch_ptr,
-                        RadixHeap *fh, RadixHeap *bh) {
-    uint32_t cur = *epoch_ptr + 1;
-    if (__builtin_expect(cur >= (1u << shift), 0)) {
-        memset(tag, 0, (size_t)n * sizeof(TagPair));
+                        const uint32_t *head, const Edge *edges,
+                        DistTable *dt, RadixHeap *heap) {
+    uint32_t cur = dt->epoch + 1;
+    if (__builtin_expect(cur >= dt->epoch_limit, 0)) {
+        memset(dt->tag, 0, (size_t)n * sizeof(uint64_t));
         cur = 1;
     }
-    *epoch_ptr = cur;
+    dt->epoch = cur;
 
-    const uint64_t stamp = (uint64_t)cur << shift;
-    const uint64_t mask = ((uint64_t)1 << shift) - 1;
+    const uint64_t stamp = (uint64_t)cur << dt->shift;
+    const int shift = dt->shift;
+    const uint64_t mask = dt->mask;
+    uint64_t *tag = dt->tag;
 
-    rh_reset(fh);
-    rh_reset(bh);
-    tag[s].f = stamp;
-    tag[t].b = stamp;
-    rh_push(fh, 0, s);
-    rh_push(bh, 0, t);
+    rh_reset(heap);
+    tag[s] = stamp; /* distance 0 */
+    rh_push(heap, 0, s);
 
-    int64_t best = INT64_MAX;
+    while (heap->total) {
+        HeapNode top = rh_pop(heap);
+        int64_t d = top.d;
+        uint32_t u = top.u;
 
-    for (;;) {
-        if (!fh->total || !bh->total) break;
-        /* last is a lower bound on each heap's minimum, and every unexplored
-         * s-t path costs at least the sum of the two minima. */
-        if (fh->last + bh->last >= best) break;
+        if (__builtin_expect((int64_t)(tag[u] & mask) != d, 0)) continue; /* stale */
+        if (u == t) return d;
 
-        if (fh->last <= bh->last) {
-            HeapNode top = rh_pop(fh);
-            int64_t d = top.d;
-            uint32_t u = top.u;
-            TagPair *tu = &tag[u];
-            if (__builtin_expect((int64_t)(tu->f & mask) != d, 0)) continue; /* stale */
-
-            uint64_t y = tu->b;
-            if ((y >> shift) == cur) {
-                int64_t cand = d + (int64_t)(y & mask);
-                if (cand < best) best = cand;
-            }
-
-            uint32_t e = head[u];
-            uint32_t e_end = head[u + 1];
-            for (; e < e_end; e++) {
-                if (PF && e + PF < e_end) __builtin_prefetch(&tag[fedges[e + PF].v].f, 1, 3);
-                uint32_t v = fedges[e].v;
-                int64_t nd = d + (int64_t)fedges[e].w;
-                TagPair *tv = &tag[v];
-                uint64_t x = tv->f;
-                uint64_t y2 = tv->b;
-                if ((y2 >> shift) == cur) {
-                    int64_t cand = nd + (int64_t)(y2 & mask);
-                    if (cand < best) best = cand;
-                }
-                if ((x >> shift) != cur) {
-                    tv->f = stamp | (uint64_t)nd;
-                    rh_push(fh, nd, v);
-                } else if (nd < (int64_t)(x & mask)) {
-                    tv->f = stamp | (uint64_t)nd;
-                    rh_push(fh, nd, v);
-                }
-            }
-        } else {
-            HeapNode top = rh_pop(bh);
-            int64_t d = top.d;
-            uint32_t u = top.u;
-            TagPair *tu = &tag[u];
-            if (__builtin_expect((int64_t)(tu->b & mask) != d, 0)) continue; /* stale */
-
-            uint64_t y = tu->f;
-            if ((y >> shift) == cur) {
-                int64_t cand = d + (int64_t)(y & mask);
-                if (cand < best) best = cand;
-            }
-
-            uint32_t e = rhead[u];
-            uint32_t e_end = rhead[u + 1];
-            for (; e < e_end; e++) {
-                if (PF && e + PF < e_end) __builtin_prefetch(&tag[redges[e + PF].v].b, 1, 3);
-                uint32_t v = redges[e].v; /* a predecessor of u */
-                int64_t nd = d + (int64_t)redges[e].w;
-                TagPair *tv = &tag[v];
-                uint64_t x = tv->b;
-                uint64_t y2 = tv->f;
-                if ((y2 >> shift) == cur) {
-                    int64_t cand = nd + (int64_t)(y2 & mask);
-                    if (cand < best) best = cand;
-                }
-                if ((x >> shift) != cur) {
-                    tv->b = stamp | (uint64_t)nd;
-                    rh_push(bh, nd, v);
-                } else if (nd < (int64_t)(x & mask)) {
-                    tv->b = stamp | (uint64_t)nd;
-                    rh_push(bh, nd, v);
-                }
+        uint32_t e = head[u];
+        uint32_t e_end = head[u + 1];
+        for (; e < e_end; e++) {
+            if (PF && e + PF < e_end) __builtin_prefetch(&tag[edges[e + PF].v], 1, 3);
+            uint32_t v = edges[e].v;
+            int64_t nd = d + (int64_t)edges[e].w;
+            uint64_t x = tag[v];
+            if ((x >> shift) != cur) {
+                tag[v] = stamp | (uint64_t)nd;
+                rh_push(heap, nd, v);
+            } else if (nd < (int64_t)(x & mask)) {
+                tag[v] = stamp | (uint64_t)nd;
+                rh_push(heap, nd, v);
             }
         }
     }
-
-    return best == INT64_MAX ? -1 : best;
+    return -1;
 }
 
 typedef struct {
     uint32_t n;
     const uint32_t *head;
     const Edge *edges;
-    const uint32_t *rhead;
-    const Edge *redges;
     const uint64_t *has_in;
     Query *queries;
     int num_queries;
@@ -274,16 +219,22 @@ static void *worker_func(void *arg) {
     WorkerContext *ctx = (WorkerContext *)arg;
     uint32_t n = ctx->n;
 
-    TagPair *tag = (TagPair *)calloc(n, sizeof(TagPair));
-    if (!tag) {
+    DistTable dt;
+    dt.tag = (uint64_t *)calloc((size_t)n + 1, sizeof(uint64_t));
+    dt.mask = ((uint64_t)1 << ctx->dbits) - 1;
+    dt.shift = ctx->dbits;
+    dt.epoch = 0;
+    {
+        uint64_t lim = (uint64_t)1 << ctx->dbits;
+        dt.epoch_limit = lim > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)lim;
+    }
+    if (!dt.tag) {
         fputs("out of memory\n", stderr);
         exit(1);
     }
 
-    RadixHeap fh, bh;
-    rh_init(&fh);
-    rh_init(&bh);
-    uint32_t epoch = 0;
+    RadixHeap heap;
+    rh_init(&heap);
 
     for (;;) {
         int q = atomic_fetch_add_explicit(&global_query_idx, 1, memory_order_relaxed);
@@ -304,15 +255,13 @@ static void *worker_func(void *arg) {
             /* s has no out-edges, so it reaches nothing else. */
             ans = -1;
         } else {
-            ans = shortest(s, t, n, ctx->head, ctx->edges, ctx->rhead, ctx->redges,
-                           tag, ctx->dbits, &epoch, &fh, &bh);
+            ans = shortest(s, t, n, ctx->head, ctx->edges, &dt, &heap);
         }
         ctx->queries[q].ans = ans;
     }
 
-    rh_free(&fh);
-    rh_free(&bh);
-    free(tag);
+    rh_free(&heap);
+    free(dt.tag);
     return NULL;
 }
 
@@ -349,54 +298,12 @@ static int available_cpus(void) {
 }
 
 /* ------------------------------------------------------------------------- */
-/* Parallel helpers.                                                         */
-/* ------------------------------------------------------------------------- */
-
-typedef void (*RangeFn)(void *ctx, int idx);
-
-typedef struct {
-    RangeFn fn;
-    void *ctx;
-    int idx;
-} RangeArg;
-
-static void *range_thread(void *arg) {
-    RangeArg *a = (RangeArg *)arg;
-    a->fn(a->ctx, a->idx);
-    return NULL;
-}
-
-/* Runs fn(ctx, 0..count-1) across threads; index 0 runs on the caller. */
-static void run_ranges(int count, RangeFn fn, void *ctx) {
-    pthread_t th[MAX_BUILD_THREADS];
-    RangeArg args[MAX_BUILD_THREADS];
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 128 * 1024);
-
-    int started = 0;
-    for (int i = 1; i < count; i++) {
-        args[i].fn = fn;
-        args[i].ctx = ctx;
-        args[i].idx = i;
-        if (pthread_create(&th[started], &attr, range_thread, &args[i]) != 0) {
-            fn(ctx, i); /* could not start a thread: do the range inline */
-            continue;
-        }
-        started++;
-    }
-    pthread_attr_destroy(&attr);
-    fn(ctx, 0);
-    for (int i = 0; i < started; i++) pthread_join(th[i], NULL);
-}
-
-/* ------------------------------------------------------------------------- */
-/* Parallel CSR construction from the text file.                             */
+/* Parallel CSR construction.                                                */
 /*                                                                           */
 /* The edge lines are split into line-aligned chunks. Pass 1 counts each      */
-/* chunk's out-degrees into a private array; the counts are summed into the   */
-/* CSR offsets. Pass 2 scatters edges into their final slots, taking a slot   */
-/* from a shared cursor with a relaxed atomic add (contention is rare         */
+/* chunk's out-degrees into a private array; the counts are then summed into  */
+/* the CSR offsets. Pass 2 scatters edges into their final slots, taking a    */
+/* slot from a shared cursor with a relaxed atomic add (contention is rare    */
 /* because tails are spread over the whole node set).                         */
 /* ------------------------------------------------------------------------- */
 
@@ -417,11 +324,52 @@ typedef struct {
     int pass;
 } BuildCtx;
 
+typedef void (*RangeFn)(void *ctx, int idx);
+
+typedef struct {
+    RangeFn fn;
+    void *ctx;
+    int idx;
+} RangeArg;
+
+static void *range_thread(void *arg) {
+    RangeArg *a = (RangeArg *)arg;
+    a->fn(a->ctx, a->idx);
+    return NULL;
+}
+
+/* Runs fn(ctx, 0..count-1) across threads; caller handles index 0. */
+static void run_ranges(int count, RangeFn fn, void *ctx) {
+    pthread_t th[MAX_BUILD_THREADS];
+    RangeArg args[MAX_BUILD_THREADS];
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 128 * 1024);
+
+    int started = 0;
+    for (int i = 1; i < count; i++) {
+        args[i].fn = fn;
+        args[i].ctx = ctx;
+        args[i].idx = i;
+        if (pthread_create(&th[started], &attr, range_thread, &args[i]) != 0) {
+            /* Could not start a thread: do that range inline. */
+            fn(ctx, i);
+            continue;
+        }
+        started++;
+    }
+    pthread_attr_destroy(&attr);
+    fn(ctx, 0);
+    for (int i = 0; i < started; i++) pthread_join(th[i], NULL);
+}
+
 static void build_range(void *vctx, int idx) {
     BuildCtx *b = (BuildCtx *)vctx;
     const char *p = b->ranges[idx].start;
     const char *end = b->ranges[idx].end;
     uint32_t n = b->n;
+    uint64_t *bits = b->inbits[idx];
+    const uint64_t *tmask = b->target_mask;
 
     if (b->pass == 1) {
         uint32_t *cnt = b->cnt[idx];
@@ -436,8 +384,6 @@ static void build_range(void *vctx, int idx) {
         return;
     }
 
-    uint64_t *bits = b->inbits[idx];
-    const uint64_t *tmask = b->target_mask;
     Edge *edges = b->edges;
     uint32_t *cursor = b->cursor;
     for (uint32_t i = 0; i < b->m && p < end; i++) {
@@ -458,47 +404,6 @@ static void build_range(void *vctx, int idx) {
         }
         if (__builtin_expect(v < n && (tmask[v >> 6] & (1ULL << (v & 63))) != 0, 0))
             bits[v >> 6] |= 1ULL << (v & 63);
-    }
-}
-
-/* ------------------------------------------------------------------------- */
-/* Reverse CSR, built from the forward one: one sequential pass over the      */
-/* edges to count in-degrees, one to scatter.                                 */
-/* ------------------------------------------------------------------------- */
-
-typedef struct {
-    const uint32_t *bounds;   /* count+1 node-range bounds */
-    const uint32_t *head;
-    const Edge *edges;
-    uint32_t **icnt;
-    uint32_t *rcursor;
-    Edge *redges;
-    int pass;
-} RevCtx;
-
-static void rev_range(void *vctx, int idx) {
-    RevCtx *r = (RevCtx *)vctx;
-    uint32_t lo = r->bounds[idx], hi = r->bounds[idx + 1];
-
-    if (r->pass == 1) {
-        uint32_t *cnt = r->icnt[idx];
-        for (uint32_t u = lo; u < hi; u++) {
-            uint32_t e = r->head[u], e_end = r->head[u + 1];
-            for (; e < e_end; e++) cnt[r->edges[e].v]++;
-        }
-        return;
-    }
-
-    Edge *redges = r->redges;
-    uint32_t *rcursor = r->rcursor;
-    for (uint32_t u = lo; u < hi; u++) {
-        uint32_t e = r->head[u], e_end = r->head[u + 1];
-        for (; e < e_end; e++) {
-            uint32_t v = r->edges[e].v;
-            uint32_t pos = __atomic_fetch_add(&rcursor[v], 1u, __ATOMIC_RELAXED);
-            redges[pos].v = u;
-            redges[pos].w = r->edges[e].w;
-        }
     }
 }
 
@@ -584,6 +489,7 @@ int main(int argc, char **argv) {
     const char *edges_start = p;
 
     size_t bitmap_words = (size_t)((n + 63) >> 6);
+    if (bitmap_words == 0) bitmap_words = 1;
 
     /* In-degree is only needed for query targets, so track those in a small
      * bitmap instead of touching an n-entry array once per edge. */
@@ -629,7 +535,7 @@ int main(int argc, char **argv) {
     b.inbits = (uint64_t **)calloc((size_t)build_threads, sizeof(uint64_t *));
     if (!b.cnt || !b.inbits) return 1;
     for (int i = 0; i < build_threads; i++) {
-        b.cnt[i] = (uint32_t *)calloc((size_t)n, sizeof(uint32_t));
+        b.cnt[i] = (uint32_t *)calloc((size_t)n + 1, sizeof(uint32_t));
         b.inbits[i] = (uint64_t *)calloc(bitmap_words, sizeof(uint64_t));
         if (!b.cnt[i] || !b.inbits[i]) return 1;
     }
@@ -661,51 +567,15 @@ int main(int argc, char **argv) {
     for (int i = 0; i < build_threads; i++) {
         const uint64_t *src = b.inbits[i];
         for (size_t k = 0; k < bitmap_words; k++) has_in[k] |= src[k];
+        free(b.cnt[i]);
         free(b.inbits[i]);
     }
+    free(b.cnt);
     free(b.inbits);
+    free(cursor);
     free(target_mask);
     munmap((void *)base, file_size);
     close(fd);
-
-    /* Reverse CSR, counted from the forward CSR instead of the text. */
-    uint32_t *rhead = (uint32_t *)malloc(((size_t)n + 1) * sizeof(uint32_t));
-    uint32_t *rcursor = (uint32_t *)malloc(((size_t)n + 1) * sizeof(uint32_t));
-    Edge *redges = (Edge *)malloc((size_t)m * sizeof(Edge));
-    if (!rhead || !rcursor || !redges) return 1;
-
-    uint32_t nbounds[MAX_BUILD_THREADS + 1];
-    for (int i = 0; i <= build_threads; i++)
-        nbounds[i] = (uint32_t)(((uint64_t)n * (uint64_t)i) / (uint64_t)build_threads);
-
-    for (int i = 0; i < build_threads; i++)
-        memset(b.cnt[i], 0, (size_t)n * sizeof(uint32_t));
-
-    RevCtx r;
-    memset(&r, 0, sizeof(r));
-    r.bounds = nbounds;
-    r.head = head;
-    r.edges = edges;
-    r.icnt = b.cnt;
-    r.redges = redges;
-
-    r.pass = 1;
-    run_ranges(build_threads, rev_range, &r);
-
-    rhead[0] = 0;
-    for (uint32_t u = 0; u < n; u++) {
-        uint32_t s = 0;
-        for (int i = 0; i < build_threads; i++) s += b.cnt[i][u];
-        rhead[u + 1] = rhead[u] + s;
-        rcursor[u] = rhead[u];
-    }
-
-    r.pass = 2;
-    r.rcursor = rcursor;
-    run_ranges(build_threads, rev_range, &r);
-
-    for (int i = 0; i < build_threads; i++) free(b.cnt[i]);
-    free(b.cnt);
 
     /* Parallel Dijkstra from a shared queue. */
     int num_threads = available_cpus();
@@ -718,8 +588,6 @@ int main(int argc, char **argv) {
     ctx.n = n;
     ctx.head = head;
     ctx.edges = edges;
-    ctx.rhead = rhead;
-    ctx.redges = redges;
     ctx.has_in = has_in;
     ctx.queries = queries;
     ctx.num_queries = num_queries;
@@ -754,8 +622,6 @@ int main(int argc, char **argv) {
 
     free(head);
     free(edges);
-    free(rhead);
-    free(redges);
     free(has_in);
     free(queries);
     return 0;
