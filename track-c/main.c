@@ -9,7 +9,16 @@
 #include <unistd.h>
 
 #define MAX_COUNTRIES 1024
-#define ARENA_CAP (16 * 1024 * 1024)
+#define REGION_CAP 1048576
+#define REGION_MASK (REGION_CAP - 1)
+
+typedef struct {
+  uint64_t region_id;
+  uint16_t country_idx;
+  uint8_t occupied;
+} RegionEntry;
+
+static RegionEntry *region_table = NULL;
 
 typedef struct {
   uint32_t hash;
@@ -30,13 +39,12 @@ typedef struct {
   NameEntry *names;
 } CountryAgg;
 
-static uint16_t *region_map = NULL;
-static uint32_t region_max = 0;
 static char country_names[MAX_COUNTRIES][64];
 static int total_countries = 1; // 0 is _UNMATCHED
 
 static char *name_arena = NULL;
-static uint32_t arena_used = 0;
+static size_t arena_cap = 0;
+static size_t arena_used = 0;
 static CountryAgg aggs[MAX_COUNTRIES];
 
 static int get_country_idx(const char *name, size_t len) {
@@ -52,8 +60,34 @@ static int get_country_idx(const char *name, size_t len) {
   return idx;
 }
 
+static inline void insert_region(uint64_t reg_id, uint16_t country_idx) {
+  uint32_t slot = (uint32_t)((reg_id * 11400714819323198485ULL) >> 32) & REGION_MASK;
+  while (region_table[slot].occupied) {
+    if (region_table[slot].region_id == reg_id) {
+      region_table[slot].country_idx = country_idx;
+      return;
+    }
+    slot = (slot + 1) & REGION_MASK;
+  }
+  region_table[slot].region_id = reg_id;
+  region_table[slot].country_idx = country_idx;
+  region_table[slot].occupied = 1;
+}
+
+static inline uint16_t lookup_region(uint64_t reg_id) {
+  uint32_t slot = (uint32_t)((reg_id * 11400714819323198485ULL) >> 32) & REGION_MASK;
+  while (region_table[slot].occupied) {
+    if (region_table[slot].region_id == reg_id)
+      return region_table[slot].country_idx;
+    slot = (slot + 1) & REGION_MASK;
+  }
+  return 0; // _UNMATCHED
+}
+
 static void load_regions(const char *path) {
   strcpy(country_names[0], "_UNMATCHED");
+  region_table = (RegionEntry *)calloc(REGION_CAP, sizeof(RegionEntry));
+
   int fd = open(path, O_RDONLY);
   if (fd < 0) return;
   struct stat st;
@@ -71,36 +105,21 @@ static void load_regions(const char *path) {
 
   if (sz >= 3 && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF)
     p += 3;
-  while (p < end && *p != '\n') p++;
-  if (p < end && *p == '\n') p++;
-
-  uint32_t max_id = 0;
-  const char *scan = p;
-  while (scan < end) {
-    uint32_t id = 0;
-    while (scan < end && *scan >= '0' && *scan <= '9') {
-      id = id * 10 + (*scan++ - '0');
-    }
-    if (id > max_id) max_id = id;
-    while (scan < end && *scan != '\n') scan++;
-    if (scan < end && *scan == '\n') scan++;
-  }
-
-  region_max = max_id;
-  region_map = (uint16_t *)calloc((size_t)max_id + 1, sizeof(uint16_t));
-
-  p = scan = (const char *)buf;
-  if (sz >= 3 && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF)
-    p += 3;
-  while (p < end && *p != '\n') p++;
-  if (p < end && *p == '\n') p++;
+  while (p < end && *p != '\n' && *p != '\r') p++;
+  while (p < end && (*p == '\r' || *p == '\n')) p++;
 
   while (p < end) {
     while (p < end && (*p == '\r' || *p == '\n')) p++;
     if (p >= end) break;
-    uint32_t reg_id = 0;
-    while (p < end && *p >= '0' && *p <= '9')
-      reg_id = reg_id * 10 + (*p++ - '0');
+
+    if (p + 3 <= end && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF)
+      p += 3;
+
+    uint64_t reg_id = 0;
+    while (p < end && *p != ',') {
+      if (*p >= '0' && *p <= '9') reg_id = reg_id * 10 + (*p - '0');
+      p++;
+    }
     if (p < end && *p == ',') p++;
 
     const char *c_start = p;
@@ -115,13 +134,11 @@ static void load_regions(const char *path) {
       while (p < end && *p != '\r' && *p != '\n') p++;
       c_len = (size_t)(p - c_start);
     }
-    while (p < end && *p != '\n') p++;
-    if (p < end && *p == '\n') p++;
+    while (p < end && (*p == '\r' || *p == '\n')) p++;
 
     if (c_len > 0) {
       uint16_t c_idx = (uint16_t)get_country_idx(c_start, c_len);
-      if (reg_id <= region_max)
-        region_map[reg_id] = c_idx;
+      insert_region(reg_id, c_idx);
     }
   }
   munmap(buf, sz);
@@ -172,44 +189,18 @@ static inline void add_name(CountryAgg *agg, const char *str, uint32_t len) {
     slot = (slot + 1) & mask;
   }
 
-  if (arena_used + len <= ARENA_CAP) {
-    memcpy(name_arena + arena_used, str, len);
-    agg->names[slot].hash = h;
-    agg->names[slot].offset = arena_used;
-    agg->names[slot].len_plus_1 = target_len_plus_1;
-    arena_used += len;
-    agg->names_count++;
-  }
-}
-
-static inline int64_t parse_cents(const char **pp, const char *end) {
-  const char *p = *pp;
-  int neg = 0;
-  if (p < end && *p == '-') {
-    neg = 1;
-    p++;
-  }
-  int64_t dollars = 0;
-  while (p < end && *p >= '0' && *p <= '9') {
-    dollars = dollars * 10 + (*p++ - '0');
+  if (arena_used + len > arena_cap) {
+    arena_cap = arena_cap ? arena_cap * 2 : (32 * 1024 * 1024);
+    while (arena_used + len > arena_cap) arena_cap *= 2;
+    name_arena = (char *)realloc(name_arena, arena_cap);
   }
 
-  int64_t cents = 0;
-  if (p < end && *p == '.') {
-    p++;
-    int d = 0;
-    while (p < end && *p >= '0' && *p <= '9' && d < 2) {
-      cents = cents * 10 + (*p++ - '0');
-      d++;
-    }
-    if (d == 1) cents *= 10;
-    while (p < end && *p >= '0' && *p <= '9') p++;
-  }
-  while (p < end && *p != ',' && *p != '\n' && *p != '\r') p++;
-
-  *pp = p;
-  int64_t total = dollars * 100 + cents;
-  return neg ? -total : total;
+  memcpy(name_arena + arena_used, str, len);
+  agg->names[slot].hash = h;
+  agg->names[slot].offset = (uint32_t)arena_used;
+  agg->names[slot].len_plus_1 = target_len_plus_1;
+  arena_used += len;
+  agg->names_count++;
 }
 
 static void format_cents(char *buf, int64_t cents) {
@@ -231,7 +222,9 @@ int main(int argc, char **argv) {
       out_dir = argv[++i];
   }
 
-  name_arena = (char *)malloc(ARENA_CAP);
+  arena_cap = 32 * 1024 * 1024;
+  name_arena = (char *)malloc(arena_cap);
+
   for (int i = 0; i < MAX_COUNTRIES; i++) {
     aggs[i].amount_min = INT64_MAX;
     aggs[i].amount_max = INT64_MIN;
@@ -261,10 +254,10 @@ int main(int argc, char **argv) {
 
   if (total_size >= 3 && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF)
     p += 3;
-  while (p < end && *p != '\n') p++;
-  if (p < end && *p == '\n') p++;
+  while (p < end && *p != '\n' && *p != '\r') p++;
+  while (p < end && (*p == '\r' || *p == '\n')) p++;
 
-  char name_scratch[4096];
+  char name_scratch[65536];
 
   while (p < end) {
     while (p < end && (*p == '\r' || *p == '\n')) p++;
@@ -273,11 +266,15 @@ int main(int argc, char **argv) {
     if (p + 3 <= end && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF)
       p += 3;
 
+    // Field 1: id
     int64_t rec_id = 0;
-    while (p < end && *p >= '0' && *p <= '9')
-      rec_id = rec_id * 10 + (*p++ - '0');
+    while (p < end && *p != ',') {
+      if (*p >= '0' && *p <= '9') rec_id = rec_id * 10 + (*p - '0');
+      p++;
+    }
     if (p < end && *p == ',') p++;
 
+    // Field 2: name
     uint32_t name_len = 0;
     if (p < end && *p == '"') {
       p++;
@@ -301,8 +298,10 @@ int main(int argc, char **argv) {
         p++;
       }
     }
+    while (p < end && *p != ',') p++;
     if (p < end && *p == ',') p++;
 
+    // Field 3: note
     uint64_t note_len = 0;
     if (p < end && *p == '"') {
       p++;
@@ -325,24 +324,52 @@ int main(int argc, char **argv) {
       while (p < end && *p != ',') p++;
       note_len = (size_t)(p - ns);
     }
+    while (p < end && *p != ',') p++;
     if (p < end && *p == ',') p++;
 
-    uint32_t reg_id = 0;
-    while (p < end && *p >= '0' && *p <= '9')
-      reg_id = reg_id * 10 + (*p++ - '0');
+    // Field 4: region_id
+    uint64_t reg_id = 0;
+    while (p < end && *p != ',') {
+      if (*p >= '0' && *p <= '9') reg_id = reg_id * 10 + (*p - '0');
+      p++;
+    }
     if (p < end && *p == ',') p++;
 
-    int64_t cents = parse_cents(&p, end);
-    while (p < end && *p != '\n') p++;
-    if (p < end && *p == '\n') p++;
+    // Field 5: amount
+    int neg = 0;
+    int64_t dollars = 0;
+    int64_t cents = 0;
+    while (p < end && *p != '\n' && *p != '\r') {
+      if (*p == '-') {
+        neg = 1;
+      } else if (*p >= '0' && *p <= '9') {
+        dollars = dollars * 10 + (*p - '0');
+      } else if (*p == '.') {
+        p++;
+        int d = 0;
+        while (p < end && *p >= '0' && *p <= '9' && d < 2) {
+          cents = cents * 10 + (*p - '0');
+          d++;
+          p++;
+        }
+        if (d == 1) cents *= 10;
+        while (p < end && *p != '\n' && *p != '\r') p++;
+        break;
+      }
+      p++;
+    }
+    while (p < end && (*p == '\r' || *p == '\n')) p++;
 
-    uint16_t c_idx = (reg_id <= region_max) ? region_map[reg_id] : 0;
+    int64_t total_cents = dollars * 100 + cents;
+    if (neg) total_cents = -total_cents;
+
+    uint16_t c_idx = lookup_region(reg_id);
     CountryAgg *ca = &aggs[c_idx];
     ca->count++;
     ca->id_sum += rec_id;
-    ca->amount_sum += cents;
-    if (cents < ca->amount_min) ca->amount_min = cents;
-    if (cents > ca->amount_max) ca->amount_max = cents;
+    ca->amount_sum += total_cents;
+    if (total_cents < ca->amount_min) ca->amount_min = total_cents;
+    if (total_cents > ca->amount_max) ca->amount_max = total_cents;
     ca->name_bytes += name_len;
     ca->note_bytes += note_len;
     add_name(ca, name_scratch, name_len);
@@ -380,6 +407,6 @@ int main(int argc, char **argv) {
   }
   fclose(out);
   free(name_arena);
-  if (region_map) free(region_map);
+  if (region_table) free(region_table);
   return 0;
 }
