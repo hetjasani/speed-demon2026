@@ -10,26 +10,30 @@ column is `local` until a live-board run replaces it.
 | 1 | Original pure-C version: CSR + 4-ary heap + 16 threads | local | 5.64 | 301 |
 | 2 | Radix heap, packed epoch+distance word, parallel two-pass CSR, exact shortcuts, prefetch | local | 2.03 | 200 |
 | 3 | BFS-order relabelling of the graph, shared degree counters, 16 build threads | local | 1.13 | 177 |
+| 4 | Parse the graph once into an edge buffer, fill the CSR by node range | local | 0.80 | 177 |
 
 Steps 1 and 2 are the same binary pair, alternating run 1 / run 2 on one machine
 (5 rounds, `min` of each; medians 6.48 s and 2.49 s). On `sample`: 0.18 s and
 0.09 s. Peak RSS is from `/usr/bin/time -v`-style `%M`.
 
-Step 3 was measured against step 2 interleaved on `full`, two rounds:
+Steps 3 and 4 were measured against step 2 interleaved on `full`. The last
+comparison (3 rounds, quiet host, load average 0.8-1.4, same `full` hash on both
+sides) is the headline:
 
 | Round | Version | Wall | User | Query phase | Peak RSS |
 |---|---|---|---|---|---|
-| 1 | step 2 | 1.61 s | 10.74 s | 1.25 s | 200 MB |
-| 1 | step 3 | 1.13 s | 6.80 s | 0.67 s | 177 MB |
-| 2 | step 2 | 1.75 s | 12.44 s | 1.41 s | 200 MB |
-| 2 | step 3 | 1.43 s | 8.28 s | 0.82 s | 177 MB |
+| 1 | step 2 (shipped, 46.128) | 1.52 s | 10.77 s | 1.22 s | 200 MB |
+| 1 | step 4 | 0.79 s | 4.89 s | 0.45 s | 177 MB |
+| 2 | step 2 | 1.35 s | 10.57 s | 1.08 s | 200 MB |
+| 2 | step 4 | 0.82 s | 4.98 s | 0.47 s | 177 MB |
+| 3 | step 2 | 1.30 s | 10.37 s | 1.09 s | 200 MB |
+| 3 | step 4 | 0.81 s | 5.13 s | 0.48 s | 177 MB |
 
-Both versions write the same `full` hash. Per phase on step 3 (`full`):
-`pass1=0.07-0.08, prefix=0.01, pass2=0.19-0.23, bfs+deg=0.14-0.22,
-perm=0.05-0.06, query=0.67-0.82`, i.e. preprocessing is now 40 % of the run and
-the query phase is 1.9x cheaper than in step 2. Query-only, 200 queries on the
-full graph, `min` of 4 interleaved runs: step 2 `0.144-0.187 s`, step 3
-`0.072-0.080 s`.
+So 1.6x wall and 2.1x less CPU, with the query phase 2.4x cheaper. Per phase on
+step 4 (`full`): `build=0.18-0.20, bfs+deg=0.13, perm=0.04, rest=0.01,
+query=0.45-0.48`, i.e. preprocessing and queries now cost about the same.
+Query-only, 200 queries on the full graph, `min` of 4 interleaved runs: step 2
+`0.144-0.187 s`, step 4 `0.071-0.078 s`.
 
 
 ## Measurement caveat

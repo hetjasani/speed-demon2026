@@ -45,13 +45,19 @@ the queries that never need a search at all.
    SHA-256 gate and by differential fuzzing against the Python reference on 420
    random graphs (zero weights, `2^32-1` weights, islands, isolated nodes).
 
-5. **Parallel graph build.** The edge lines are split into line-aligned chunks.
-   Pass 1 counts out-degrees per chunk into a shared counter array; the counters
-   are summed into the CSR offsets. Pass 2 parses the three fields and scatters
-   edges into their slots, taking each slot from a shared cursor with a relaxed
-   atomic add (contention is rare because tails cover the whole node set). The
-   BFS that decides the new numbering is serial, because the order *is* the
-   product; everything that only rewrites data is threaded.
+5. **Parallel graph build, one parse.** The 92 MB of text are read exactly once:
+   each thread owns a line-aligned byte range, parses the three integers, counts
+   the tail into a shared degree array and drops `(u, v, w)` into its own slice
+   of an edge buffer (12 bytes per row). The degree array is prefix-summed into
+   the CSR offsets and the text is unmapped immediately, so it never competes
+   with the edge buffer for RSS. Pass 2 then fills the CSR **by node range**: a
+   thread rescans the parsed buffer and keeps only the rows whose tail falls in
+   its slice of the ids. Every write of a thread therefore stays inside a
+   contiguous, cache-resident slice of the edge array, no cursor needs an atomic
+   and no edge is touched by two threads. That fixed the two problems of the old
+   scatter — the random 8-byte atomic into a 40 MB array, and the second parse of
+   the text. The BFS that decides the new numbering is serial, because the order
+   *is* the product; everything that only rewrites data is threaded.
 
 6. **Exact O(1) shortcuts.** `s == t` is 0; a source with no out-edges and a
    target with no in-edges are `-1` without touching the graph. In-degrees are
@@ -98,13 +104,20 @@ None (C Standard Library and POSIX only).
 ## With another 24 hours
 
 A real route-planning index: contraction hierarchies or ALT landmarks. Both need
-preprocessing that is charged to the run, and at this graph size the landmark
-Dijkstra runs cost about as much as the queries they would save, so they need a
-contraction step (or a very small landmark set) to pay off. On the build side,
-the second pass over the edge text is now the largest remaining preprocessing
-item, and a bucket partition by tail (write each parsed edge into the region of
-its tail's bucket, then fill the CSR bucket by bucket so that the cursors stay in
-cache) would remove the per-edge atomic and its random write. Also worth
-measuring on the target box: whether the build should use fewer threads than the
-query phase, since the build is memory-bandwidth bound while the queries are
-latency bound.
+preprocessing that is charged to the run. ALT is out on the numbers: one full
+landmark Dijkstra costs about a quarter of the whole query phase, and the edges
+of this graph are cheap local streets next to 4x faster highways, so a geometric
+bound alone is weak. A contraction hierarchy would pay for itself, but building
+one in a run of this size does not.
+
+The measured split is now `build 0.19 s + numbering 0.17 s + permute 0.04 s +
+queries 0.45 s`, so the two remaining items are:
+
+- **Fewer settled nodes.** Batching several heap pops and relaxing their edges at
+  the same time would raise memory-level parallelism: one core scales 2.2x to
+  eight on this box, which is the signature of a latency-bound dependent load
+  chain (pop -> `head[u]` -> `edges[]`) rather than of bandwidth or arithmetic.
+- **A cheaper numbering.** The BFS is serial, ~0.1 s; it is 12 % of the run and
+  the only part that does not use the machine. A parallel BFS that keeps the
+  order inside a level would be worth 10 % on its own.
+

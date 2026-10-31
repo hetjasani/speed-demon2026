@@ -448,6 +448,10 @@ typedef struct {
     const uint64_t *target_mask;
     Edge *edges;
     uint32_t *cursor;
+    uint32_t (*tmp)[3];      /* the parsed edges, one row per input edge */
+    uint32_t *tmp_count;     /* rows filled by each range */
+    uint32_t tmp_cap;        /* rows reserved per range */
+    int parts;
     int pass;
 } BuildCtx;
 
@@ -500,39 +504,49 @@ static void build_range(void *vctx, int idx) {
 
     if (b->pass == 1) {
         uint32_t *cnt = b->cnt;
-        for (uint32_t i = 0; i < b->m && p < end; i++) {
+        uint32_t (*tmp)[3] = b->tmp + (size_t)idx * b->tmp_cap;
+        uint32_t cap = b->tmp_cap;
+        uint32_t i = 0;
+        for (; i < b->m && p < end; i++) {
             while (p < end && (unsigned)(*p - '0') > 9) p++;
             if (p >= end) break;
-            uint32_t u;
+            uint32_t u, v, w;
             p = parse_u32(p, end, &u);
+            while (p < end && (*p == ' ' || *p == '\t')) p++;
+            p = parse_u32(p, end, &v);
+            while (p < end && (*p == ' ' || *p == '\t')) p++;
+            p = parse_u32(p, end, &w);
             p = skip_line(p, end);
+            if (i < cap) { tmp[i][0] = u; tmp[i][1] = v; tmp[i][2] = w; }
             /* Tails are spread over the whole node set, so contention on the
              * counters is negligible; one shared array beats one per thread. */
             if (u < n) __atomic_fetch_add(&cnt[u], 1u, __ATOMIC_RELAXED);
+            if (__builtin_expect(v < n && (tmask[v >> 6] & (1ULL << (v & 63))) != 0, 0))
+                bits[v >> 6] |= 1ULL << (v & 63);
         }
+        b->tmp_count[idx] = i < cap ? i : cap;
         return;
     }
 
+    /* Keep the edges parsed once, in `tmp`, and fill the CSR by node range:
+     * each thread rescans the parsed edges and keeps only those whose tail is
+     * in its own slice of the node ids. That costs a sequential re-read of the
+     * edge buffer, but every write then lands in a slice of the CSR small
+     * enough to stay in cache, and no cursor needs an atomic. */
+    uint32_t lo = (uint32_t)(((uint64_t)b->n * (uint64_t)idx) / (uint64_t)b->parts);
+    uint32_t hi = (uint32_t)(((uint64_t)b->n * (uint64_t)(idx + 1)) / (uint64_t)b->parts);
     Edge *edges = b->edges;
     uint32_t *cursor = b->cursor;
-    for (uint32_t i = 0; i < b->m && p < end; i++) {
-        while (p < end && (unsigned)(*p - '0') > 9) p++;
-        if (p >= end) break;
-        uint32_t u, v, w;
-        p = parse_u32(p, end, &u);
-        while (p < end && (*p == ' ' || *p == '\t')) p++;
-        p = parse_u32(p, end, &v);
-        while (p < end && (*p == ' ' || *p == '\t')) p++;
-        p = parse_u32(p, end, &w);
-        p = skip_line(p, end);
-
-        if (u < n) {
-            uint32_t pos = __atomic_fetch_add(&cursor[u], 1u, __ATOMIC_RELAXED);
-            edges[pos].v = v;
-            edges[pos].w = w;
+    for (int r = 0; r < b->parts; r++) {
+        const uint32_t (*src)[3] = (const uint32_t (*)[3])(b->tmp + (size_t)r * b->tmp_cap);
+        uint32_t k = b->tmp_count[r];
+        for (uint32_t i = 0; i < k; i++) {
+            uint32_t u = src[i][0];
+            if (u < lo || u >= hi) continue;
+            uint32_t slot = cursor[u]++;
+            edges[slot].v = src[i][1];
+            edges[slot].w = src[i][2];
         }
-        if (__builtin_expect(v < n && (tmask[v >> 6] & (1ULL << (v & 63))) != 0, 0))
-            bits[v >> 6] |= 1ULL << (v & 63);
     }
 }
 
@@ -662,15 +676,26 @@ int main(int argc, char **argv) {
 
     b.cnt = (uint32_t *)calloc((size_t)n + 1, sizeof(uint32_t));
     b.inbits = (uint64_t **)calloc((size_t)build_threads, sizeof(uint64_t *));
-    if (!b.cnt || !b.inbits) return 1;
+    b.tmp_count = (uint32_t *)calloc((size_t)build_threads, sizeof(uint32_t));
+    b.parts = build_threads;
+    /* Byte ranges are equal in size and the edge lines have nearly constant
+     * length, so a generous fixed slack per range is enough; it only exists to
+     * absorb the variance in digits per line. */
+    b.tmp_cap = (uint32_t)(m / (uint32_t)build_threads + 262144u);
+    b.tmp = (uint32_t (*)[3])malloc((size_t)build_threads * b.tmp_cap * 3u * sizeof(uint32_t));
+    if (!b.cnt || !b.inbits || !b.tmp_count || !b.tmp) return 1;
     for (int i = 0; i < build_threads; i++) {
         b.inbits[i] = (uint64_t *)calloc(bitmap_words, sizeof(uint64_t));
         if (!b.inbits[i]) return 1;
     }
 
-    /* Pass 1: out-degree of every node. */
+    /* Pass 1: parse the graph once and count the out-degrees. */
     b.pass = 1;
     run_ranges(build_threads, build_range, &b);
+
+    /* The text is no longer needed: everything comes from the parsed rows. */
+    munmap((void *)base, file_size);
+    close(fd);
 
     /* Prefix sums give the CSR offsets. */
     uint32_t *head = (uint32_t *)malloc(((size_t)n + 1) * sizeof(uint32_t));
@@ -683,13 +708,14 @@ int main(int argc, char **argv) {
         cursor[u] = head[u];
     }
 
-    /* Pass 2: scatter edges into CSR, and note incoming edges to targets. */
+    /* Pass 2: fill the CSR, one node range per thread. */
     Edge *edges = (Edge *)malloc((size_t)m * sizeof(Edge));
     if (!edges) return 1;
     b.edges = edges;
     b.cursor = cursor;
     b.pass = 2;
     run_ranges(build_threads, build_range, &b);
+    free(b.tmp);
 
     for (int i = 0; i < build_threads; i++) {
         const uint64_t *src = b.inbits[i];
@@ -698,9 +724,8 @@ int main(int argc, char **argv) {
     }
     free(b.cnt);
     free(b.inbits);
+    free(b.tmp_count);
     free(cursor);
-    munmap((void *)base, file_size);
-    close(fd);
 
     /* Relabel the nodes in BFS order so that the ball of nodes a query
      * settles occupies a narrow band of ids, then rewrite the CSR in that
