@@ -17,9 +17,25 @@
 
 #define MAX_COUNTRIES 1024
 #define MAX_THREADS 32
-#define MAX_CHUNKS 256
+#define MAX_CHUNKS 128
 #define REGION_CAP 1048576
 #define REGION_MASK (REGION_CAP - 1)
+#define THREAD_POOL_SIZE (4 * 1024 * 1024)
+
+typedef struct {
+  char *buf;
+  size_t cap;
+  size_t used;
+} MemPool;
+
+static inline void *pool_alloc(MemPool *mp, size_t sz) {
+  sz = (sz + 7) & ~7ULL;
+  if (__builtin_expect(mp->used + sz > mp->cap, 0)) return NULL;
+  void *ptr = mp->buf + mp->used;
+  mp->used += sz;
+  memset(ptr, 0, sz);
+  return ptr;
+}
 
 typedef struct {
   uint64_t region_id;
@@ -60,6 +76,7 @@ typedef struct {
 static char country_names[MAX_COUNTRIES][64];
 static int total_countries = 1; // 0 is _UNMATCHED
 
+static MemPool thread_pools[MAX_THREADS];
 static LocalCountryAgg thread_aggs[MAX_THREADS][MAX_COUNTRIES];
 static FinalCountryAgg final_aggs[MAX_COUNTRIES];
 
@@ -68,30 +85,31 @@ static size_t g_file_size = 0;
 static size_t g_chunk_boundaries[MAX_CHUNKS + 1];
 static int g_num_chunks = 0;
 static int g_num_threads = 1;
-static atomic_int g_chunk_counter = 0;
+static atomic_int g_work_counter = 0;
+static atomic_int g_merge_counter = 0;
+static pthread_barrier_t g_barrier;
 
-static inline void add_name(NameTable *nt, uint64_t hash) {
+static inline void pool_add_name(MemPool *mp, NameTable *nt, uint64_t hash) {
   if (__builtin_expect((nt->count * 2) >= nt->cap, 0)) {
     uint32_t old_cap = nt->cap;
     uint32_t new_cap = old_cap ? (old_cap * 2) : 256;
-    uint64_t *new_slots = (uint64_t *)calloc(new_cap, sizeof(uint64_t));
+    uint64_t *new_slots = (uint64_t *)pool_alloc(mp, new_cap * sizeof(uint64_t));
     uint32_t new_mask = new_cap - 1;
     if (nt->slots) {
       for (uint32_t i = 0; i < old_cap; i++) {
         uint64_t v = nt->slots[i];
         if (v != 0) {
-          uint32_t s = (uint32_t)(v ^ (v >> 32)) & new_mask;
+          uint32_t s = (uint32_t)v & new_mask;
           while (new_slots[s] != 0) s = (s + 1) & new_mask;
           new_slots[s] = v;
         }
       }
-      free(nt->slots);
     }
     nt->slots = new_slots;
     nt->cap = new_cap;
   }
   uint32_t mask = nt->cap - 1;
-  uint32_t slot = (uint32_t)(hash ^ (hash >> 32)) & mask;
+  uint32_t slot = (uint32_t)hash & mask;
   while (nt->slots[slot] != 0) {
     if (nt->slots[slot] == hash) return;
     slot = (slot + 1) & mask;
@@ -193,6 +211,8 @@ static void load_regions(const char *path) {
 }
 
 static void parse_slice(int tid, const char *p, const char *end) {
+  MemPool *mp = &thread_pools[tid];
+
   while (p < end) {
     while (p < end && (*p == '\r' || *p == '\n')) p++;
     if (p >= end) break;
@@ -207,7 +227,7 @@ static void parse_slice(int tid, const char *p, const char *end) {
     }
     if (p < end && *p == ',') p++;
 
-    // Field 2: name (hashed on the fly with FNV-1a)
+    // Field 2: name (hashed on the fly with 64-bit FNV-1a + Murmur avalanche)
     uint64_t name_h = 14695981039346656037ULL;
     uint32_t name_len = 0;
     if (p < end && *p == '"') {
@@ -244,7 +264,7 @@ static void parse_slice(int tid, const char *p, const char *end) {
     name_h ^= name_h >> 33;
     if (__builtin_expect(name_h == 0, 0)) name_h = 1;
 
-    // Field 3: note (length only)
+    // Field 3: note (unescaped length only)
     uint64_t note_len = 0;
     if (p < end && *p == '"') {
       p++;
@@ -316,14 +336,16 @@ static void parse_slice(int tid, const char *p, const char *end) {
     if (total_cents > ca->amount_max) ca->amount_max = total_cents;
     ca->name_bytes += name_len;
     ca->note_bytes += note_len;
-    add_name(&ca->names, name_h);
+    pool_add_name(mp, &ca->names, name_h);
   }
 }
 
-static void *worker_thread(void *arg) {
+static void *worker_func(void *arg) {
   int tid = *(int *)arg;
+
+  // Phase 1: Parse assigned chunks in parallel
   for (;;) {
-    int idx = atomic_fetch_add(&g_chunk_counter, 1);
+    int idx = atomic_fetch_add(&g_work_counter, 1);
     if (idx >= g_num_chunks) break;
 
     size_t s = g_chunk_boundaries[idx];
@@ -332,6 +354,62 @@ static void *worker_thread(void *arg) {
       parse_slice(tid, g_file_base + s, g_file_base + e);
     }
   }
+
+  // Synchronize before aggregation
+  pthread_barrier_wait(&g_barrier);
+
+  // Phase 2: Parallel merge using a flat, reusable 256 KB L2-resident cache buffer
+  #define MERGE_TABLE_CAP 32768
+  #define MERGE_TABLE_MASK (MERGE_TABLE_CAP - 1)
+  uint64_t *merge_slots = (uint64_t *)malloc(MERGE_TABLE_CAP * sizeof(uint64_t));
+
+  for (;;) {
+    int ci = atomic_fetch_add(&g_merge_counter, 1);
+    if (ci >= total_countries) break;
+
+    FinalCountryAgg *fa = &final_aggs[ci];
+    fa->amount_min = INT64_MAX;
+    fa->amount_max = INT64_MIN;
+
+    for (int t = 0; t < g_num_threads; t++) {
+      LocalCountryAgg *la = &thread_aggs[t][ci];
+      if (la->count == 0) continue;
+      fa->count += la->count;
+      fa->id_sum += la->id_sum;
+      fa->amount_sum += la->amount_sum;
+      if (la->amount_min < fa->amount_min) fa->amount_min = la->amount_min;
+      if (la->amount_max > fa->amount_max) fa->amount_max = la->amount_max;
+      fa->name_bytes += la->name_bytes;
+      fa->note_bytes += la->note_bytes;
+    }
+
+    if (fa->count == 0) continue;
+
+    memset(merge_slots, 0, MERGE_TABLE_CAP * sizeof(uint64_t));
+    uint32_t distinct_cnt = 0;
+
+    for (int t = 0; t < g_num_threads; t++) {
+      NameTable *s = &thread_aggs[t][ci].names;
+      if (s->slots) {
+        for (uint32_t k = 0; k < s->cap; k++) {
+          uint64_t v = s->slots[k];
+          if (v != 0) {
+            uint32_t slot = (uint32_t)v & MERGE_TABLE_MASK;
+            while (merge_slots[slot] != 0) {
+              if (merge_slots[slot] == v) goto already_in_table;
+              slot = (slot + 1) & MERGE_TABLE_MASK;
+            }
+            merge_slots[slot] = v;
+            distinct_cnt++;
+            already_in_table:;
+          }
+        }
+      }
+    }
+    fa->names_count = distinct_cnt;
+  }
+
+  free(merge_slots);
   return NULL;
 }
 
@@ -354,7 +432,6 @@ int main(int argc, char **argv) {
       out_dir = argv[++i];
   }
 
-  // Detect available CPUs
   int ncpus = 1;
   cpu_set_t cs;
   CPU_ZERO(&cs);
@@ -368,7 +445,10 @@ int main(int argc, char **argv) {
   if (ncpus < 1) ncpus = 1;
   g_num_threads = ncpus;
 
-  for (int t = 0; t < MAX_THREADS; t++) {
+  for (int t = 0; t < g_num_threads; t++) {
+    thread_pools[t].buf = (char *)malloc(THREAD_POOL_SIZE);
+    thread_pools[t].cap = THREAD_POOL_SIZE;
+    thread_pools[t].used = 0;
     for (int i = 0; i < MAX_COUNTRIES; i++) {
       thread_aggs[t][i].amount_min = INT64_MAX;
       thread_aggs[t][i].amount_max = INT64_MIN;
@@ -386,14 +466,13 @@ int main(int argc, char **argv) {
   if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); return 1; }
   g_file_size = (size_t)st.st_size;
 
-  g_file_base = (const char *)mmap(NULL, g_file_size, PROT_READ, MAP_SHARED, fd, 0);
+  g_file_base = (const char *)mmap(NULL, g_file_size, PROT_READ, MAP_PRIVATE, fd, 0);
   close(fd);
   if (g_file_base == MAP_FAILED) return 1;
 
   madvise((void *)g_file_base, g_file_size, MADV_WILLNEED | MADV_SEQUENTIAL);
 
-  // SIMD Quote-Parity Record Boundary Detection (Runs in ~2ms)
-  int num_chunks = g_num_threads * 4;
+  int num_chunks = g_num_threads * 2;
   if (num_chunks > MAX_CHUNKS) num_chunks = MAX_CHUNKS;
   size_t nominal_chunk = g_file_size / num_chunks;
   if (nominal_chunk < 65536) nominal_chunk = 65536;
@@ -456,64 +535,20 @@ int main(int argc, char **argv) {
   g_chunk_boundaries[cur_chunk] = g_file_size;
   g_num_chunks = cur_chunk;
 
-  // Run multithreaded parse
+  pthread_barrier_init(&g_barrier, NULL, (unsigned)g_num_threads);
+
   pthread_t th[MAX_THREADS];
   int tids[MAX_THREADS];
   for (int t = 0; t < g_num_threads; t++) {
     tids[t] = t;
-    pthread_create(&th[t], NULL, worker_thread, &tids[t]);
+    pthread_create(&th[t], NULL, worker_func, &tids[t]);
   }
   for (int t = 0; t < g_num_threads; t++) {
     pthread_join(th[t], NULL);
   }
-
+  pthread_barrier_destroy(&g_barrier);
   munmap((void *)g_file_base, g_file_size);
 
-  // Fast country aggregation
-  for (int ci = 0; ci < total_countries; ci++) {
-    FinalCountryAgg *fa = &final_aggs[ci];
-    fa->amount_min = INT64_MAX;
-    fa->amount_max = INT64_MIN;
-    uint32_t est_names = 0;
-
-    for (int t = 0; t < g_num_threads; t++) {
-      LocalCountryAgg *la = &thread_aggs[t][ci];
-      if (la->count == 0) continue;
-      fa->count += la->count;
-      fa->id_sum += la->id_sum;
-      fa->amount_sum += la->amount_sum;
-      if (la->amount_min < fa->amount_min) fa->amount_min = la->amount_min;
-      if (la->amount_max > fa->amount_max) fa->amount_max = la->amount_max;
-      fa->name_bytes += la->name_bytes;
-      fa->note_bytes += la->note_bytes;
-      est_names += la->names.count;
-    }
-
-    if (fa->count == 0) continue;
-
-    NameTable final_table = {NULL, 0, 0};
-    uint32_t cap = 256;
-    while (cap < est_names * 2) cap *= 2;
-    final_table.cap = cap;
-    final_table.slots = (uint64_t *)calloc(cap, sizeof(uint64_t));
-
-    for (int t = 0; t < g_num_threads; t++) {
-      NameTable *s = &thread_aggs[t][ci].names;
-      if (s->slots) {
-        for (uint32_t k = 0; k < s->cap; k++) {
-          if (s->slots[k] != 0) {
-            add_name(&final_table, s->slots[k]);
-          }
-        }
-        free(s->slots);
-        s->slots = NULL;
-      }
-    }
-    fa->names_count = final_table.count;
-    free(final_table.slots);
-  }
-
-  // Sort and emit output
   int valid[MAX_COUNTRIES], valid_cnt = 0;
   for (int ci = 0; ci < total_countries; ci++) {
     if (final_aggs[ci].count > 0)
@@ -542,6 +577,10 @@ int main(int argc, char **argv) {
             (unsigned long long)ca->note_bytes);
   }
   fclose(out);
+
+  for (int t = 0; t < g_num_threads; t++) {
+    free(thread_pools[t].buf);
+  }
   if (region_table) free(region_table);
 
   return 0;
