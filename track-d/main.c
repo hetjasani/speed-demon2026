@@ -293,15 +293,14 @@ static void *worker_func(void *arg) {
 /* ------------------------------------------------------------------------- */
 
 static void bfs_order(uint32_t n, const uint32_t *head, const Edge *edges,
-                      uint32_t *pos, uint32_t *order) {
-    memset(pos, 0xFF, (size_t)n * sizeof(uint32_t));
+                      uint64_t *seen, uint32_t *order, uint32_t *head2) {
     uint32_t start = 0, best = 0;
     for (uint32_t u = 0; u < n; u++) {
         uint32_t d = head[u + 1] - head[u];
         if (d > best) { best = d; start = u; }
     }
     uint32_t lo = 0, qt = 1;
-    pos[start] = 0;
+    seen[start >> 6] = 1ULL << (start & 63);
     order[0] = start;
     while (lo < qt) {
         uint32_t hi = qt; /* end of the current level */
@@ -316,10 +315,18 @@ static void bfs_order(uint32_t n, const uint32_t *head, const Edge *edges,
             }
             uint32_t u = order[i];
             uint32_t e = head[u], e_end = head[u + 1];
+            /* The BFS already reads this node's offsets to walk its edges, so
+             * its out-degree in the new order is free here: no second random
+             * pass over head[] later. */
+            head2[i + 1] = e_end - e;
             for (; e < e_end; e++) {
                 uint32_t v = edges[e].v;
-                if (v < n && pos[v] == UINT32_MAX) {
-                    pos[v] = qt;
+                if (v >= n) continue;
+                /* A bitmap, not the 7 MB id table: at 1 bit per node it stays
+                 * in L2, so the "have I seen v?" probe is not a cache miss. */
+                uint64_t m = 1ULL << (v & 63);
+                if ((seen[v >> 6] & m) == 0) {
+                    seen[v >> 6] |= m;
                     order[qt++] = v;
                 }
             }
@@ -328,26 +335,28 @@ static void bfs_order(uint32_t n, const uint32_t *head, const Edge *edges,
     }
     /* Nodes the BFS never reached go last; they are rare (isolated parts). */
     for (uint32_t u = 0; u < n; u++)
-        if (pos[u] == UINT32_MAX) { pos[u] = qt; order[qt++] = u; }
+        if ((seen[u >> 6] & (1ULL << (u & 63))) == 0) {
+            seen[u >> 6] |= 1ULL << (u & 63);
+            order[qt] = u;
+            head2[qt + 1] = head[u + 1] - head[u];
+            qt++;
+        }
 }
 
+/* pos[order[i]] = i, in parallel: the BFS no longer builds this table. */
 typedef struct {
-    const uint32_t *head;
     const uint32_t *order;
-    uint32_t *head2;
+    uint32_t *pos;
     const uint32_t *part_lo;
     const uint32_t *part_hi;
-} DegCtx;
+} PosCtx;
 
-/* Out-degree of every node in the new order. The random `head[order[nu]]`
- * probes dominate, so it is done in parallel; the prefix sum stays serial. */
-static void deg_range(void *vctx, int idx) {
-    DegCtx *c = (DegCtx *)vctx;
+static void pos_range(void *vctx, int idx) {
+    PosCtx *c = (PosCtx *)vctx;
     uint32_t lo = c->part_lo[idx], hi = c->part_hi[idx];
-    for (uint32_t nu = lo; nu < hi; nu++) {
-        uint32_t u = c->order[nu];
-        c->head2[nu + 1] = c->head[u + 1] - c->head[u];
-        if (nu + 32 < hi) __builtin_prefetch(&c->head[c->order[nu + 32]], 0, 1);
+    for (uint32_t i = lo; i < hi; i++) {
+        c->pos[c->order[i]] = i;
+        if (i + 32 < hi) __builtin_prefetch(&c->pos[c->order[i + 32]], 1, 3);
     }
 }
 
@@ -427,11 +436,12 @@ static int available_cpus(void) {
 /* ------------------------------------------------------------------------- */
 /* Parallel CSR construction.                                                */
 /*                                                                           */
-/* The edge lines are split into line-aligned chunks. Pass 1 counts each      */
-/* chunk's out-degrees into a private array; the counts are then summed into  */
-/* the CSR offsets. Pass 2 scatters edges into their final slots, taking a    */
-/* slot from a shared cursor with a relaxed atomic add (contention is rare    */
-/* because tails are spread over the whole node set).                         */
+/* The edge lines are split into line-aligned chunks and parsed once into     */
+/* three flat arrays (one per field). The degrees are then counted, and the    */
+/* CSR filled, by *node range*: a thread re-reads the parsed rows and keeps    */
+/* only those whose tail falls in its own slice of the ids. Every write of a   */
+/* thread is then inside a contiguous, cache-resident slice of the CSR, so no  */
+/* cursor needs an atomic and no counter is written by two threads.            */
 /* ------------------------------------------------------------------------- */
 
 typedef struct {
@@ -443,17 +453,26 @@ typedef struct {
     Range *ranges;
     uint32_t n;
     uint32_t m;
-    uint32_t *cnt;           /* shared out-degree counters (atomic adds) */
     uint64_t **inbits;       /* per-range "has an incoming edge" bitmaps */
     const uint64_t *target_mask;
     Edge *edges;
-    uint32_t *cursor;
-    uint32_t (*tmp)[3];      /* the parsed edges, one row per input edge */
+    uint32_t *head;          /* CSR offsets */
+    uint32_t *loc;           /* per-part local degrees, later per-part cursors */
+    uint32_t loc_stride;
+    uint32_t *base;          /* first edge slot of each part's node range */
+    uint32_t *tu, *tv, *tw;  /* the parsed edges, one array per field */
     uint32_t *tmp_count;     /* rows filled by each range */
     uint32_t tmp_cap;        /* rows reserved per range */
     int parts;
-    int pass;
 } BuildCtx;
+
+static inline uint32_t part_lo(const BuildCtx *b, int idx) {
+    return (uint32_t)(((uint64_t)b->n * (uint64_t)idx) / (uint64_t)b->parts);
+}
+
+static inline uint32_t part_hi(const BuildCtx *b, int idx) {
+    return (uint32_t)(((uint64_t)b->n * (uint64_t)(idx + 1)) / (uint64_t)b->parts);
+}
 
 typedef void (*RangeFn)(void *ctx, int idx);
 
@@ -501,51 +520,83 @@ static void build_range(void *vctx, int idx) {
     uint32_t n = b->n;
     uint64_t *bits = b->inbits[idx];
     const uint64_t *tmask = b->target_mask;
-
-    if (b->pass == 1) {
-        uint32_t *cnt = b->cnt;
-        uint32_t (*tmp)[3] = b->tmp + (size_t)idx * b->tmp_cap;
-        uint32_t cap = b->tmp_cap;
-        uint32_t i = 0;
-        for (; i < b->m && p < end; i++) {
-            while (p < end && (unsigned)(*p - '0') > 9) p++;
-            if (p >= end) break;
-            uint32_t u, v, w;
-            p = parse_u32(p, end, &u);
-            while (p < end && (*p == ' ' || *p == '\t')) p++;
-            p = parse_u32(p, end, &v);
-            while (p < end && (*p == ' ' || *p == '\t')) p++;
-            p = parse_u32(p, end, &w);
-            p = skip_line(p, end);
-            if (i < cap) { tmp[i][0] = u; tmp[i][1] = v; tmp[i][2] = w; }
-            /* Tails are spread over the whole node set, so contention on the
-             * counters is negligible; one shared array beats one per thread. */
-            if (u < n) __atomic_fetch_add(&cnt[u], 1u, __ATOMIC_RELAXED);
-            if (__builtin_expect(v < n && (tmask[v >> 6] & (1ULL << (v & 63))) != 0, 0))
-                bits[v >> 6] |= 1ULL << (v & 63);
-        }
-        b->tmp_count[idx] = i < cap ? i : cap;
-        return;
+    uint32_t *tu = b->tu + (size_t)idx * b->tmp_cap;
+    uint32_t *tv = b->tv + (size_t)idx * b->tmp_cap;
+    uint32_t *tw = b->tw + (size_t)idx * b->tmp_cap;
+    uint32_t cap = b->tmp_cap;
+    uint32_t i = 0;
+    for (; i < b->m && p < end; i++) {
+        while (p < end && (unsigned)(*p - '0') > 9) p++;
+        if (p >= end) break;
+        uint32_t u, v, w;
+        p = parse_u32(p, end, &u);
+        while (p < end && (*p == ' ' || *p == '\t')) p++;
+        p = parse_u32(p, end, &v);
+        while (p < end && (*p == ' ' || *p == '\t')) p++;
+        p = parse_u32(p, end, &w);
+        p = skip_line(p, end);
+        if (i < cap) { tu[i] = u; tv[i] = v; tw[i] = w; }
+        if (__builtin_expect(v < n && (tmask[v >> 6] & (1ULL << (v & 63))) != 0, 0))
+            bits[v >> 6] |= 1ULL << (v & 63);
     }
+    b->tmp_count[idx] = i < cap ? i : cap;
+}
 
-    /* Keep the edges parsed once, in `tmp`, and fill the CSR by node range:
-     * each thread rescans the parsed edges and keeps only those whose tail is
-     * in its own slice of the node ids. That costs a sequential re-read of the
-     * edge buffer, but every write then lands in a slice of the CSR small
-     * enough to stay in cache, and no cursor needs an atomic. */
-    uint32_t lo = (uint32_t)(((uint64_t)b->n * (uint64_t)idx) / (uint64_t)b->parts);
-    uint32_t hi = (uint32_t)(((uint64_t)b->n * (uint64_t)(idx + 1)) / (uint64_t)b->parts);
-    Edge *edges = b->edges;
-    uint32_t *cursor = b->cursor;
+/* Out-degree of the nodes in this part's id range. Counting into a local
+ * array keeps every increment in L1/L2; the alternative -- one shared counter
+ * array bumped during the parse -- costs a random access into 7 MB per edge. */
+static void count_range(void *vctx, int idx) {
+    BuildCtx *b = (BuildCtx *)vctx;
+    uint32_t lo = part_lo(b, idx), hi = part_hi(b, idx);
+    uint32_t span = hi - lo;
+    uint32_t *loc = b->loc + (size_t)idx * b->loc_stride;
+    memset(loc, 0, (size_t)span * sizeof(uint32_t));
     for (int r = 0; r < b->parts; r++) {
-        const uint32_t (*src)[3] = (const uint32_t (*)[3])(b->tmp + (size_t)r * b->tmp_cap);
+        const uint32_t *src = b->tu + (size_t)r * b->tmp_cap;
         uint32_t k = b->tmp_count[r];
         for (uint32_t i = 0; i < k; i++) {
-            uint32_t u = src[i][0];
-            if (u < lo || u >= hi) continue;
-            uint32_t slot = cursor[u]++;
-            edges[slot].v = src[i][1];
-            edges[slot].w = src[i][2];
+            uint32_t u = src[i];
+            if (u - lo < span) loc[u - lo]++; /* true iff lo <= u < hi */
+        }
+    }
+    uint32_t acc = 0;
+    for (uint32_t k = 0; k < span; k++) {
+        uint32_t c = loc[k];
+        loc[k] = acc;
+        acc += c;
+    }
+    b->base[idx + 1] = acc;
+}
+
+/* Write this part's offsets and scatter its edges. `loc` already holds the
+ * local prefix sums, so it becomes the cursor array: cache-hot, private. */
+static void fill_range(void *vctx, int idx) {
+    BuildCtx *b = (BuildCtx *)vctx;
+    uint32_t lo = part_lo(b, idx), hi = part_hi(b, idx);
+    uint32_t span = hi - lo;
+    uint32_t *loc = b->loc + (size_t)idx * b->loc_stride;
+    uint32_t *head = b->head;
+    uint32_t base = b->base[idx];
+    Edge *edges = b->edges;
+
+    for (uint32_t k = 0; k < span; k++) {
+        uint32_t p = base + loc[k];
+        loc[k] = p;
+        head[lo + k] = p;
+    }
+    if (hi == b->n) head[b->n] = b->base[b->parts];
+
+    for (int r = 0; r < b->parts; r++) {
+        const uint32_t *su = b->tu + (size_t)r * b->tmp_cap;
+        const uint32_t *sv = b->tv + (size_t)r * b->tmp_cap;
+        const uint32_t *sw = b->tw + (size_t)r * b->tmp_cap;
+        uint32_t k = b->tmp_count[r];
+        for (uint32_t i = 0; i < k; i++) {
+            uint32_t u = su[i];
+            if (u - lo >= span) continue;
+            uint32_t slot = loc[u - lo]++;
+            edges[slot].v = sv[i];
+            edges[slot].w = sw[i];
         }
     }
 }
@@ -674,7 +725,6 @@ int main(int argc, char **argv) {
     b.m = m;
     b.target_mask = target_mask;
 
-    b.cnt = (uint32_t *)calloc((size_t)n + 1, sizeof(uint32_t));
     b.inbits = (uint64_t **)calloc((size_t)build_threads, sizeof(uint64_t *));
     b.tmp_count = (uint32_t *)calloc((size_t)build_threads, sizeof(uint32_t));
     b.parts = build_threads;
@@ -682,50 +732,52 @@ int main(int argc, char **argv) {
      * length, so a generous fixed slack per range is enough; it only exists to
      * absorb the variance in digits per line. */
     b.tmp_cap = (uint32_t)(m / (uint32_t)build_threads + 262144u);
-    b.tmp = (uint32_t (*)[3])malloc((size_t)build_threads * b.tmp_cap * 3u * sizeof(uint32_t));
-    if (!b.cnt || !b.inbits || !b.tmp_count || !b.tmp) return 1;
+    size_t tmp_rows = (size_t)build_threads * b.tmp_cap;
+    b.tu = (uint32_t *)malloc(tmp_rows * sizeof(uint32_t));
+    b.tv = (uint32_t *)malloc(tmp_rows * sizeof(uint32_t));
+    b.tw = (uint32_t *)malloc(tmp_rows * sizeof(uint32_t));
+    b.loc_stride = n / (uint32_t)build_threads + 2;
+    b.loc = (uint32_t *)malloc((size_t)build_threads * b.loc_stride * sizeof(uint32_t));
+    b.base = (uint32_t *)calloc((size_t)build_threads + 1, sizeof(uint32_t));
+    b.head = (uint32_t *)malloc(((size_t)n + 1) * sizeof(uint32_t));
+    if (!b.inbits || !b.tmp_count || !b.tu || !b.tv || !b.tw || !b.loc || !b.base || !b.head)
+        return 1;
     for (int i = 0; i < build_threads; i++) {
         b.inbits[i] = (uint64_t *)calloc(bitmap_words, sizeof(uint64_t));
         if (!b.inbits[i]) return 1;
     }
 
-    /* Pass 1: parse the graph once and count the out-degrees. */
-    b.pass = 1;
+    /* Pass 1: parse the graph once. */
     run_ranges(build_threads, build_range, &b);
 
     /* The text is no longer needed: everything comes from the parsed rows. */
     munmap((void *)base, file_size);
     close(fd);
 
-    /* Prefix sums give the CSR offsets. */
-    uint32_t *head = (uint32_t *)malloc(((size_t)n + 1) * sizeof(uint32_t));
-    uint32_t *cursor = (uint32_t *)malloc(((size_t)n + 1) * sizeof(uint32_t));
-    if (!head || !cursor) return 1;
-    head[0] = 0;
-    for (uint32_t u = 0; u < n; u++) {
-        uint32_t s = b.cnt[u];
-        head[u + 1] = head[u] + s;
-        cursor[u] = head[u];
-    }
+    /* Pass 2: out-degrees per node, counted inside each part's id range. */
+    run_ranges(build_threads, count_range, &b);
+    b.base[0] = 0;
+    for (int i = 1; i <= build_threads; i++) b.base[i] += b.base[i - 1];
 
-    /* Pass 2: fill the CSR, one node range per thread. */
+    /* Pass 3: write the offsets and fill the CSR. */
     Edge *edges = (Edge *)malloc((size_t)m * sizeof(Edge));
     if (!edges) return 1;
     b.edges = edges;
-    b.cursor = cursor;
-    b.pass = 2;
-    run_ranges(build_threads, build_range, &b);
-    free(b.tmp);
+    run_ranges(build_threads, fill_range, &b);
 
     for (int i = 0; i < build_threads; i++) {
         const uint64_t *src = b.inbits[i];
         for (size_t k = 0; k < bitmap_words; k++) has_in[k] |= src[k];
         free(b.inbits[i]);
     }
-    free(b.cnt);
+    free(b.tu);
+    free(b.tv);
+    free(b.tw);
+    free(b.loc);
+    free(b.base);
     free(b.inbits);
     free(b.tmp_count);
-    free(cursor);
+    uint32_t *head = b.head;
 
     /* Relabel the nodes in BFS order so that the ball of nodes a query
      * settles occupies a narrow band of ids, then rewrite the CSR in that
@@ -735,9 +787,11 @@ int main(int argc, char **argv) {
         uint32_t *order = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
         uint32_t *head2 = (uint32_t *)malloc(((size_t)n + 1) * sizeof(uint32_t));
         Edge *edges2 = (Edge *)malloc((size_t)m * sizeof(Edge));
-        if (!pos || !order || !head2 || !edges2) return 1;
+        uint64_t *seen = (uint64_t *)calloc(((size_t)n + 63) / 64, sizeof(uint64_t));
+        if (!pos || !order || !head2 || !edges2 || !seen) return 1;
 
-        bfs_order(n, head, edges, pos, order);
+        bfs_order(n, head, edges, seen, order, head2);
+        free(seen);
 
         uint32_t *part_lo = (uint32_t *)malloc((size_t)build_threads * sizeof(uint32_t));
         uint32_t *part_hi = (uint32_t *)malloc((size_t)build_threads * sizeof(uint32_t));
@@ -747,15 +801,13 @@ int main(int argc, char **argv) {
             part_hi[i] = (uint32_t)(((uint64_t)n * (uint64_t)(i + 1)) / (uint64_t)build_threads);
         }
 
-        /* Out-degrees in the new order, gathered in parallel (the random
-         * `head[order[nu]]` probes are the slow part), then one linear scan. */
-        DegCtx dc;
-        dc.head = head;
-        dc.order = order;
-        dc.head2 = head2;
-        dc.part_lo = part_lo;
-        dc.part_hi = part_hi;
-        run_ranges(build_threads, deg_range, &dc);
+        PosCtx xc;
+        xc.order = order;
+        xc.pos = pos;
+        xc.part_lo = part_lo;
+        xc.part_hi = part_hi;
+        run_ranges(build_threads, pos_range, &xc);
+
         head2[0] = 0;
         for (uint32_t nu = 0; nu < n; nu++) head2[nu + 1] += head2[nu];
 

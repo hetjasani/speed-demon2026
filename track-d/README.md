@@ -4,7 +4,7 @@
 
 Pure C11/POSIX, no dependencies. Every query is an exact Dijkstra that stops the
 moment the target is settled, but the usual constant factors are attacked from
-five sides: the node order, the heap, the per-node state, the graph build, and
+several sides: the node order, the heap, the per-node state, the graph build, and
 the queries that never need a search at all.
 
 1. **Radix heap instead of a comparison heap.** All weights are non-negative, so
@@ -46,18 +46,24 @@ the queries that never need a search at all.
    random graphs (zero weights, `2^32-1` weights, islands, isolated nodes).
 
 5. **Parallel graph build, one parse.** The 92 MB of text are read exactly once:
-   each thread owns a line-aligned byte range, parses the three integers, counts
-   the tail into a shared degree array and drops `(u, v, w)` into its own slice
-   of an edge buffer (12 bytes per row). The degree array is prefix-summed into
-   the CSR offsets and the text is unmapped immediately, so it never competes
-   with the edge buffer for RSS. Pass 2 then fills the CSR **by node range**: a
-   thread rescans the parsed buffer and keeps only the rows whose tail falls in
-   its slice of the ids. Every write of a thread therefore stays inside a
-   contiguous, cache-resident slice of the edge array, no cursor needs an atomic
-   and no edge is touched by two threads. That fixed the two problems of the old
-   scatter — the random 8-byte atomic into a 40 MB array, and the second parse of
-   the text. The BFS that decides the new numbering is serial, because the order
-   *is* the product; everything that only rewrites data is threaded.
+   each thread owns a line-aligned byte range and parses the three integers into
+   three flat arrays (one per field), so the text can be unmapped immediately and
+   never competes with the edge array for RSS. Degrees are then counted **by node
+   range**: a thread re-reads the parsed tails and keeps only those in its own
+   slice of the ids, incrementing a private `n/threads`-entry counter array that
+   stays in L2. (Counting during the parse instead needs a random access into a
+   7 MB shared array per edge, which measured 0.09 s on its own.) Those local
+   counts are prefix-summed and become the local cursors, so pass 3 writes the
+   offsets and scatters the edges into a contiguous, cache-resident slice of the
+   CSR: no atomic cursor, no edge touched by two threads, no second parse. That
+   fixed the two problems of the old scatter — the random 8-byte atomic into a
+   40 MB array, and the second parse of the text. The BFS that decides the new
+   numbering is serial, because the order *is* the product; everything that only
+   rewrites data is threaded. The BFS reads `head[u]`/`head[u+1]` anyway, so it
+   also fills in `head2[]` there (the degree gather needs no pass of its own),
+   and it marks visited nodes in a 1-bit-per-node bitmap (218 KB, L2-resident)
+   instead of probing the 7 MB `pos[]` table once per out-edge; `pos[]` is filled
+   by a parallel pass afterwards.
 
 6. **Exact O(1) shortcuts.** `s == t` is 0; a source with no out-edges and a
    target with no in-edges are `-1` without touching the graph. In-degrees are
@@ -91,8 +97,18 @@ runs in 15 ms, but each thread dives through its own local queue before handing
 work back, so ids are handed out along deep excursions instead of level by level.
 Sorting the nodes by level afterwards does not repair it, because the order
 *inside* a level is spatially scrambled: the measured query time went back to
-exactly that of the unrelabelled graph. The serial BFS costs ~0.1 s and buys
-1.9x on 0.7 s of queries, so it stays.
+exactly that of the unrelabelled graph. The serial BFS now costs 0.073 s (after
+the visited-bitmap change) and buys 1.9x on 0.7 s of queries, so it stays.
+
+Batching several heap pops and relaxing them together — the obvious way to raise
+memory-level parallelism — was implemented and **breaks the radix heap**: it
+advances `last` past the batch's minimum, so a key produced by the batch can be
+pushed below `last`, and the answers silently come out too large. Only the hash
+gate caught it. The same trap kills a "peek the next node and refill early"
+variant; a side-effect-free peek is correct but measured as a wash (0.066-0.069 s
+vs 0.067 s on 200 full-size queries), as did prefetching the next node's edges,
+dispatching queries in spatial order, and re-sorting the BFS order along a Morton
+curve of (level, index) (0.083 s vs 0.075 s, and a slower build).
 
 A 4-ary comparison heap was measured against the radix heap on cache-resident
 data: 0.43 s vs 0.22 s for the same queries. Not close.
@@ -110,14 +126,16 @@ of this graph are cheap local streets next to 4x faster highways, so a geometric
 bound alone is weak. A contraction hierarchy would pay for itself, but building
 one in a run of this size does not.
 
-The measured split is now `build 0.19 s + numbering 0.17 s + permute 0.04 s +
-queries 0.45 s`, so the two remaining items are:
+The measured split is now `parse 0.05 s + count 0.02 s + fill 0.07 s + numbering
+0.075 s + permute 0.045 s + queries 0.45-0.50 s`, so the two remaining items are:
 
-- **Fewer settled nodes.** Batching several heap pops and relaxing their edges at
-  the same time would raise memory-level parallelism: one core scales 2.2x to
-  eight on this box, which is the signature of a latency-bound dependent load
-  chain (pop -> `head[u]` -> `edges[]`) rather than of bandwidth or arithmetic.
-- **A cheaper numbering.** The BFS is serial, ~0.1 s; it is 12 % of the run and
+- **Fewer settled nodes.** One core scales 2.2x to eight on this box, which is
+  the signature of a latency-bound dependent load chain (pop -> `head[u]` ->
+  `edges[]`) rather than of bandwidth or arithmetic. Raising the memory-level
+  parallelism is the lever, but every safe variant measured so far is a wash;
+  what is left is bidirectional Dijkstra, which needs a transposed CSR (+40 MB)
+  and a second per-thread distance table (+14 MB/thread).
+- **A cheaper numbering.** The BFS is serial, 0.073 s; it is ~9 % of the run and
   the only part that does not use the machine. A parallel BFS that keeps the
-  order inside a level would be worth 10 % on its own.
+  order inside a level would be worth that on its own.
 

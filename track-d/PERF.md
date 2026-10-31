@@ -11,6 +11,7 @@ column is `local` until a live-board run replaces it.
 | 2 | Radix heap, packed epoch+distance word, parallel two-pass CSR, exact shortcuts, prefetch | local | 2.03 | 200 |
 | 3 | BFS-order relabelling of the graph, shared degree counters, 16 build threads | local | 1.13 | 177 |
 | 4 | Parse the graph once into an edge buffer, fill the CSR by node range | local | 0.80 | 177 |
+| 5 | Count degrees by node range, fold the degree gather into the BFS, bitmap visited | local | 0.77 | 177 |
 
 Steps 1 and 2 are the same binary pair, alternating run 1 / run 2 on one machine
 (5 rounds, `min` of each; medians 6.48 s and 2.49 s). On `sample`: 0.18 s and
@@ -87,6 +88,51 @@ live-board run.
   the query phase unchanged; the measurement was host noise. The two-branch form
   is kept because it is the one that was actually verified.
 
+
+## Step 5 details
+
+The build was profiled one phase at a time; the parse pass (0.16-0.20 s) and the
+serial BFS (0.13 s) were the two items that mattered.
+
+- **No degree counting while parsing.** Pass 1 used a shared `uint32_t[1.7 M]`
+  degree array with a relaxed atomic add per edge. Measured on `full`: parse with
+  that atomic 0.154-0.218 s, with a plain `cnt[u]++` 0.121-0.189 s, with the
+  counter folded into 8 K entries 0.089-0.139 s, and with no counting at all
+  0.065-0.075 s. So the *random 7 MB access*, not the atomic, was ~0.09 s.
+  Degrees are now counted in a second pass by node range, into a per-thread
+  slice of `n/threads` counters (870 KB, L2-resident): that pass costs 0.02 s.
+- **SoA parse buffer.** The parsed rows are kept as three flat arrays
+  (`tu/tv/tw`) instead of interleaved 12-byte rows. The count pass then reads
+  only `tu` (20 MB) instead of pulling a 60 MB line stream to use one word of
+  every row, and the fill pass only touches `tv/tw` for the rows it keeps.
+  Total pass-2/3 traffic went from ~480 MB to ~360 MB.
+- **The fill keeps local cursors.** The per-thread degree slice is already the
+  local prefix sum, so it doubles as the cursor array: no shared cursor, and
+  the offsets are written cache-hot.
+- **Degree gather folded into the BFS.** `bfs_order()` reads `head[u]` and
+  `head[u+1]` anyway to walk the edges, so `head2[i+1] = e_end - e` is free
+  there; the separate parallel `deg_range()` pass over random
+  `head[order[nu]]` is gone.
+- **Bitmap visited in the BFS.** The BFS used `pos[v] == UINT32_MAX` as its
+  visited test, i.e. a random probe of a 7 MB table per out-edge. It now uses a
+  1-bit-per-node bitmap (218 KB, stays in L2), and `pos[]` is filled afterwards
+  by a parallel `pos[order[i]] = i` pass (0.002 s). BFS: 0.125 s -> 0.073 s.
+
+Interleaved A/B on `full`, 3 rounds (`pre` is everything before the queries):
+
+| Round | Version | pre | Wall | User | Query | Peak RSS |
+|---|---|---|---|---|---|---|
+| 1 | step 4 | 0.435 s | 0.95 s | 5.21 s | 0.521 s | 177 MB |
+| 1 | step 5 | 0.267 s | 0.75 s | 4.60 s | 0.480 s | 177 MB |
+| 2 | step 4 | 0.351 s | 0.84 s | 4.91 s | 0.486 s | 177 MB |
+| 2 | step 5 | 0.272 s | 0.77 s | 4.65 s | 0.492 s | 177 MB |
+| 3 | step 4 | 0.379 s | 0.84 s | 4.83 s | 0.459 s | 177 MB |
+| 3 | step 5 | 0.284 s | 0.82 s | 4.77 s | 0.523 s | 177 MB |
+
+Per phase on step 5 (`full`, first run includes the query-file parse):
+`setup=0.06, parse=0.05, count=0.02, fill=0.07, bfs=0.073, pos=0.002,
+scan=0.003, perm=0.045, query=0.45-0.50`. Preprocessing is just under a third of
+the run now, and the queries are half of it.
 
 ## Correctness gates run
 
