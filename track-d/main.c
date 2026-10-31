@@ -15,7 +15,7 @@
 #define PF 4
 #endif
 #define MAX_THREADS 64
-#define MAX_BUILD_THREADS 8
+#define MAX_BUILD_THREADS 16
 
 /* ------------------------------------------------------------------------- */
 /* Graph storage: CSR of (head, weight) pairs.                               */
@@ -275,6 +275,23 @@ static void *worker_func(void *arg) {
 /* unchanged: this is just a permutation of the node ids.                    */
 /* ------------------------------------------------------------------------- */
 
+/* ------------------------------------------------------------------------- */
+/* Node relabelling by BFS order.                                            */
+/*                                                                           */
+/* A Dijkstra search only ever touches the nodes of a ball around s. With    */
+/* ids in BFS order that ball is a narrow band of consecutive ids, so the    */
+/* distance table, the offsets and the edge lists a query reads stay in      */
+/* cache instead of being spread over the whole arrays. The answers are      */
+/* unchanged: this is just a permutation of the node ids.                    */
+/*                                                                           */
+/* The order has to be a genuine breadth-first order, level by level, with   */
+/* the nodes of a level in discovery order. A parallel work-stealing BFS     */
+/* does not give that: a thread that dives deep numbers far-away nodes early,*/
+/* which scrambles every level and destroys exactly the locality we want.    */
+/* So the BFS is serial (it costs a few tens of milliseconds) while the      */
+/* expensive rewriting of the CSR is parallel.                               */
+/* ------------------------------------------------------------------------- */
+
 static void bfs_order(uint32_t n, const uint32_t *head, const Edge *edges,
                       uint32_t *pos, uint32_t *order) {
     memset(pos, 0xFF, (size_t)n * sizeof(uint32_t));
@@ -283,20 +300,31 @@ static void bfs_order(uint32_t n, const uint32_t *head, const Edge *edges,
         uint32_t d = head[u + 1] - head[u];
         if (d > best) { best = d; start = u; }
     }
-    uint32_t lo = 0, hi = 1, qt = 1;
+    uint32_t lo = 0, qt = 1;
     pos[start] = 0;
     order[0] = start;
-    while (lo < hi) {
+    while (lo < qt) {
+        uint32_t hi = qt; /* end of the current level */
         for (uint32_t i = lo; i < hi; i++) {
+            /* The queue is walked in BFS order, but the out-edges of a node
+             * still live at its old offset, so every node costs two dependent
+             * cache misses. Warm both a few nodes ahead. */
+            if (i + 32 < hi) __builtin_prefetch(&head[order[i + 32]], 0, 1);
+            if (i + 8 < hi) {
+                uint32_t f = order[i + 8];
+                if (head[f] < head[f + 1]) __builtin_prefetch(&edges[head[f]], 0, 1);
+            }
             uint32_t u = order[i];
             uint32_t e = head[u], e_end = head[u + 1];
             for (; e < e_end; e++) {
                 uint32_t v = edges[e].v;
-                if (v < n && pos[v] == UINT32_MAX) { pos[v] = qt; order[qt++] = v; }
+                if (v < n && pos[v] == UINT32_MAX) {
+                    pos[v] = qt;
+                    order[qt++] = v;
+                }
             }
         }
         lo = hi;
-        hi = qt;
     }
     /* Nodes the BFS never reached go last; they are rare (isolated parts). */
     for (uint32_t u = 0; u < n; u++)
@@ -305,8 +333,29 @@ static void bfs_order(uint32_t n, const uint32_t *head, const Edge *edges,
 
 typedef struct {
     const uint32_t *head;
+    const uint32_t *order;
+    uint32_t *head2;
+    const uint32_t *part_lo;
+    const uint32_t *part_hi;
+} DegCtx;
+
+/* Out-degree of every node in the new order. The random `head[order[nu]]`
+ * probes dominate, so it is done in parallel; the prefix sum stays serial. */
+static void deg_range(void *vctx, int idx) {
+    DegCtx *c = (DegCtx *)vctx;
+    uint32_t lo = c->part_lo[idx], hi = c->part_hi[idx];
+    for (uint32_t nu = lo; nu < hi; nu++) {
+        uint32_t u = c->order[nu];
+        c->head2[nu + 1] = c->head[u + 1] - c->head[u];
+        if (nu + 32 < hi) __builtin_prefetch(&c->head[c->order[nu + 32]], 0, 1);
+    }
+}
+
+typedef struct {
+    const uint32_t *head;
     const Edge *edges;
     const uint32_t *pos;
+    const uint32_t *head2;
     Edge *edges2;
     const uint32_t *order;
     const uint32_t *part_lo;
@@ -316,17 +365,21 @@ typedef struct {
     uint32_t n;
 } PermuteCtx;
 
+/* Rewrite the CSR in the new order. Offsets do not change, so every part
+ * writes a disjoint slice of the edge array: no coordination needed. */
 static void permute_range(void *vctx, int idx) {
     PermuteCtx *c = (PermuteCtx *)vctx;
     uint32_t n = c->n;
     uint32_t lo = c->part_lo[idx], hi = c->part_hi[idx];
-    /* Offsets are unchanged by the permutation, so the new edge slots of a
-     * tail depend only on that tail: every part writes a disjoint slice. */
-    uint32_t e = c->head[c->order[lo]];
+    uint32_t e = c->head2[lo];
+    /* Two-stage software pipeline over the random `order[i] -> head[u]`
+     * lookups: prefetch the offset far ahead, then the edge block of a nearer
+     * one. Reading the edges of a node is otherwise two dependent misses. */
     for (uint32_t i = lo; i < hi; i++) {
         uint32_t u = c->order[i];
         uint32_t eu = c->head[u], eu_end = c->head[u + 1];
-        if (i + 4 < hi) __builtin_prefetch(&c->head[c->order[i + 4]], 0, 1);
+        if (i + 48 < hi) __builtin_prefetch(&c->head[c->order[i + 48]], 0, 1);
+        if (i + 12 < hi) __builtin_prefetch(&c->edges[c->head[c->order[i + 12]]], 0, 1);
         for (; eu < eu_end; eu++) {
             uint32_t v = c->edges[eu].v;
             uint32_t nv = v < n ? c->pos[v] : v;
@@ -390,7 +443,7 @@ typedef struct {
     Range *ranges;
     uint32_t n;
     uint32_t m;
-    uint32_t **cnt;          /* per-range out-degree counters */
+    uint32_t *cnt;           /* shared out-degree counters (atomic adds) */
     uint64_t **inbits;       /* per-range "has an incoming edge" bitmaps */
     const uint64_t *target_mask;
     Edge *edges;
@@ -446,14 +499,16 @@ static void build_range(void *vctx, int idx) {
     const uint64_t *tmask = b->target_mask;
 
     if (b->pass == 1) {
-        uint32_t *cnt = b->cnt[idx];
+        uint32_t *cnt = b->cnt;
         for (uint32_t i = 0; i < b->m && p < end; i++) {
             while (p < end && (unsigned)(*p - '0') > 9) p++;
             if (p >= end) break;
             uint32_t u;
             p = parse_u32(p, end, &u);
             p = skip_line(p, end);
-            if (u < n) cnt[u]++;
+            /* Tails are spread over the whole node set, so contention on the
+             * counters is negligible; one shared array beats one per thread. */
+            if (u < n) __atomic_fetch_add(&cnt[u], 1u, __ATOMIC_RELAXED);
         }
         return;
     }
@@ -605,13 +660,12 @@ int main(int argc, char **argv) {
     b.m = m;
     b.target_mask = target_mask;
 
-    b.cnt = (uint32_t **)calloc((size_t)build_threads, sizeof(uint32_t *));
+    b.cnt = (uint32_t *)calloc((size_t)n + 1, sizeof(uint32_t));
     b.inbits = (uint64_t **)calloc((size_t)build_threads, sizeof(uint64_t *));
     if (!b.cnt || !b.inbits) return 1;
     for (int i = 0; i < build_threads; i++) {
-        b.cnt[i] = (uint32_t *)calloc((size_t)n + 1, sizeof(uint32_t));
         b.inbits[i] = (uint64_t *)calloc(bitmap_words, sizeof(uint64_t));
-        if (!b.cnt[i] || !b.inbits[i]) return 1;
+        if (!b.inbits[i]) return 1;
     }
 
     /* Pass 1: out-degree of every node. */
@@ -624,8 +678,7 @@ int main(int argc, char **argv) {
     if (!head || !cursor) return 1;
     head[0] = 0;
     for (uint32_t u = 0; u < n; u++) {
-        uint32_t s = 0;
-        for (int i = 0; i < build_threads; i++) s += b.cnt[i][u];
+        uint32_t s = b.cnt[u];
         head[u + 1] = head[u] + s;
         cursor[u] = head[u];
     }
@@ -641,7 +694,6 @@ int main(int argc, char **argv) {
     for (int i = 0; i < build_threads; i++) {
         const uint64_t *src = b.inbits[i];
         for (size_t k = 0; k < bitmap_words; k++) has_in[k] |= src[k];
-        free(b.cnt[i]);
         free(b.inbits[i]);
     }
     free(b.cnt);
@@ -662,12 +714,6 @@ int main(int argc, char **argv) {
 
         bfs_order(n, head, edges, pos, order);
 
-        head2[0] = 0;
-        for (uint32_t nu = 0; nu < n; nu++) {
-            uint32_t u = order[nu];
-            head2[nu + 1] = head2[nu] + (head[u + 1] - head[u]);
-        }
-
         uint32_t *part_lo = (uint32_t *)malloc((size_t)build_threads * sizeof(uint32_t));
         uint32_t *part_hi = (uint32_t *)malloc((size_t)build_threads * sizeof(uint32_t));
         if (!part_lo || !part_hi) return 1;
@@ -676,11 +722,24 @@ int main(int argc, char **argv) {
             part_hi[i] = (uint32_t)(((uint64_t)n * (uint64_t)(i + 1)) / (uint64_t)build_threads);
         }
 
+        /* Out-degrees in the new order, gathered in parallel (the random
+         * `head[order[nu]]` probes are the slow part), then one linear scan. */
+        DegCtx dc;
+        dc.head = head;
+        dc.order = order;
+        dc.head2 = head2;
+        dc.part_lo = part_lo;
+        dc.part_hi = part_hi;
+        run_ranges(build_threads, deg_range, &dc);
+        head2[0] = 0;
+        for (uint32_t nu = 0; nu < n; nu++) head2[nu + 1] += head2[nu];
+
         memset(has_in, 0, bitmap_words * sizeof(uint64_t));
         PermuteCtx pc;
         pc.head = head;
         pc.edges = edges;
         pc.pos = pos;
+        pc.head2 = head2;
         pc.edges2 = edges2;
         pc.order = order;
         pc.part_lo = part_lo;
