@@ -17,8 +17,8 @@
 #define MAX_THREADS       16
 #define REGION_TABLE_CAP  1048576   // 1M slots (16 MB static BSS)
 #define MAX_COUNTRIES     1024
-#define NAME_INIT_CAP     256
-#define MAX_CHUNKS        512
+#define NAME_INIT_CAP     1024
+#define MAX_CHUNKS        256
 
 typedef struct ArenaBlock {
     struct ArenaBlock *next;
@@ -110,6 +110,7 @@ typedef struct {
 static char *country_names[MAX_COUNTRIES];
 static int total_countries = 0;
 static int unmatched_country_idx = -1;
+static FinalCountry final_countries[MAX_COUNTRIES];
 
 static int get_or_create_country_idx(const char *name, Arena *arena) {
     for (int i = 0; i < total_countries; i++) {
@@ -166,7 +167,7 @@ static inline void thread_country_add_name(ThreadCountry *c, const char *name, s
     c->names_count++;
 }
 
-static inline void final_country_add_name(FinalCountry *c, const char *name, size_t len) {
+static inline void final_country_add_name_fast(FinalCountry *c, const char *name, size_t len, uint32_t h) {
     if (__builtin_expect(!c->names_table, 0)) {
         c->names_cap = NAME_INIT_CAP * 2;
         c->names_table = (NameEntry *)calloc(c->names_cap, sizeof(NameEntry));
@@ -186,7 +187,6 @@ static inline void final_country_add_name(FinalCountry *c, const char *name, siz
         free(old_table);
     }
 
-    uint32_t h = fast_hash_bytes(name, len);
     uint32_t mask = c->names_cap - 1;
     uint32_t slot = h & mask;
     while (c->names_table[slot].str) {
@@ -269,11 +269,16 @@ typedef struct {
 static Chunk chunks[MAX_CHUNKS];
 static int total_chunks = 0;
 static atomic_int next_chunk_idx = 0;
+static pthread_barrier_t merge_barrier;
+static int active_threads = 0;
 
 typedef struct {
+    int thread_id;
     ThreadCountry country_list[MAX_COUNTRIES];
     Arena arena;
 } ThreadContext;
+
+static ThreadContext *all_contexts = NULL;
 
 static void* worker_thread(void *arg) {
     ThreadContext *ctx = (ThreadContext *)arg;
@@ -287,6 +292,7 @@ static void* worker_thread(void *arg) {
     int64_t last_reg_id = -1;
     int32_t last_c_idx = -1;
 
+    // Phase 1: Dynamic work stealing chunk parsing
     while (1) {
         int idx = atomic_fetch_add_explicit(&next_chunk_idx, 1, memory_order_relaxed);
         if (idx >= total_chunks) break;
@@ -418,6 +424,39 @@ static void* worker_thread(void *arg) {
             thread_country_add_name(c, name_ptr, name_len, is_escaped, &ctx->arena);
         }
     }
+
+    // Synchronize: wait until all chunks are parsed
+    pthread_barrier_wait(&merge_barrier);
+
+    // Phase 2: High-speed parallel country merge across all cores
+    int tid = ctx->thread_id;
+    for (int i = tid; i < total_countries; i += active_threads) {
+        FinalCountry *final = &final_countries[i];
+        final->name = country_names[i];
+        final->amount_min = INT64_MAX;
+        final->amount_max = INT64_MIN;
+
+        for (int j = 0; j < active_threads; j++) {
+            ThreadCountry *src = &all_contexts[j].country_list[i];
+            if (src->count == 0) continue;
+            final->count += src->count;
+            final->id_sum += src->id_sum;
+            final->amount_sum += src->amount_sum;
+            if (src->amount_min < final->amount_min) final->amount_min = src->amount_min;
+            if (src->amount_max > final->amount_max) final->amount_max = src->amount_max;
+            final->name_bytes += src->name_bytes;
+            final->note_bytes += src->note_bytes;
+
+            if (src->names_table) {
+                for (uint32_t s = 0; s < src->names_cap; s++) {
+                    if (src->names_table[s].str) {
+                        final_country_add_name_fast(final, src->names_table[s].str, src->names_table[s].len, src->names_table[s].hash);
+                    }
+                }
+            }
+        }
+    }
+
     return NULL;
 }
 
@@ -468,9 +507,9 @@ int main(int argc, char **argv) {
     while (p_rec < end && *p_rec != '\n') p_rec++;
     if (p_rec < end && *p_rec == '\n') p_rec++;
 
-    // Split into ~128 fine-grained chunks for dynamic work stealing
-    size_t target_chunk_size = (file_size - (p_rec - p)) / 128;
-    if (target_chunk_size < 512 * 1024) target_chunk_size = 512 * 1024;
+    // 48 chunks provide ideal work stealing granularity without scanning lag
+    size_t target_chunk_size = (file_size - (p_rec - p)) / 48;
+    if (target_chunk_size < 1024 * 1024) target_chunk_size = 1024 * 1024;
 
     const char *scan = p_rec;
     const char *chunk_start = p_rec;
@@ -501,16 +540,20 @@ int main(int argc, char **argv) {
     int num_threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (num_threads > 14) num_threads = 14;
     if (num_threads < 1) num_threads = 1;
+    active_threads = num_threads;
+
+    pthread_barrier_init(&merge_barrier, NULL, num_threads);
 
     pthread_t threads[MAX_THREADS];
-    ThreadContext *contexts = (ThreadContext *)calloc(num_threads, sizeof(ThreadContext));
+    all_contexts = (ThreadContext *)calloc(num_threads, sizeof(ThreadContext));
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 256 * 1024);
 
     for (int i = 0; i < num_threads; i++) {
-        pthread_create(&threads[i], &attr, worker_thread, &contexts[i]);
+        all_contexts[i].thread_id = i;
+        pthread_create(&threads[i], &attr, worker_thread, &all_contexts[i]);
     }
     pthread_attr_destroy(&attr);
 
@@ -518,35 +561,7 @@ int main(int argc, char **argv) {
         pthread_join(threads[i], NULL);
     }
 
-    FinalCountry final_countries[MAX_COUNTRIES];
-    memset(final_countries, 0, sizeof(final_countries));
-
-    for (int i = 0; i < total_countries; i++) {
-        FinalCountry *final = &final_countries[i];
-        final->name = country_names[i];
-        final->amount_min = INT64_MAX;
-        final->amount_max = INT64_MIN;
-
-        for (int j = 0; j < num_threads; j++) {
-            ThreadCountry *src = &contexts[j].country_list[i];
-            if (src->count == 0) continue;
-            final->count += src->count;
-            final->id_sum += src->id_sum;
-            final->amount_sum += src->amount_sum;
-            if (src->amount_min < final->amount_min) final->amount_min = src->amount_min;
-            if (src->amount_max > final->amount_max) final->amount_max = src->amount_max;
-            final->name_bytes += src->name_bytes;
-            final->note_bytes += src->note_bytes;
-
-            if (src->names_table) {
-                for (uint32_t s = 0; s < src->names_cap; s++) {
-                    if (src->names_table[s].str) {
-                        final_country_add_name(final, src->names_table[s].str, src->names_table[s].len);
-                    }
-                }
-            }
-        }
-    }
+    pthread_barrier_destroy(&merge_barrier);
 
     FinalCountry *valid_countries[MAX_COUNTRIES];
     int valid_count = 0;
@@ -578,8 +593,6 @@ int main(int argc, char **argv) {
     }
     fclose(out);
 
-    munmap((void *)p, file_size);
-    close(fd);
-    free(contexts);
-    return 0;
+    // Fast exit: OS unmaps virtual address space immediately without walking pointers
+    _exit(0);
 }
