@@ -139,8 +139,8 @@ fn process_chunk(data: &[u8]) -> LocalResult {
         let line = &data[pos..end];
 
         if !line.is_empty() {
-            // Timestamp is always exactly 20 bytes.
-            let s1 = 20;
+            // Timestamp is always exactly 27 bytes.
+            let s1 = 27;
             let s2 = s1 + 1 + unsafe {
                 memchr(
                     line[s1 + 1..].as_ptr() as *const std::ffi::c_void,
