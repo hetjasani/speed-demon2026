@@ -647,9 +647,65 @@ int main(int argc, char **argv) {
     free(b.cnt);
     free(b.inbits);
     free(cursor);
-    free(target_mask);
     munmap((void *)base, file_size);
     close(fd);
+
+    /* Relabel the nodes in BFS order so that the ball of nodes a query
+     * settles occupies a narrow band of ids, then rewrite the CSR in that
+     * order. This is only a permutation: the answers do not change. */
+    if (n >= 2) {
+        uint32_t *pos = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
+        uint32_t *order = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
+        uint32_t *head2 = (uint32_t *)malloc(((size_t)n + 1) * sizeof(uint32_t));
+        Edge *edges2 = (Edge *)malloc((size_t)m * sizeof(Edge));
+        if (!pos || !order || !head2 || !edges2) return 1;
+
+        bfs_order(n, head, edges, pos, order);
+
+        head2[0] = 0;
+        for (uint32_t nu = 0; nu < n; nu++) {
+            uint32_t u = order[nu];
+            head2[nu + 1] = head2[nu] + (head[u + 1] - head[u]);
+        }
+
+        uint32_t *part_lo = (uint32_t *)malloc((size_t)build_threads * sizeof(uint32_t));
+        uint32_t *part_hi = (uint32_t *)malloc((size_t)build_threads * sizeof(uint32_t));
+        if (!part_lo || !part_hi) return 1;
+        for (int i = 0; i < build_threads; i++) {
+            part_lo[i] = (uint32_t)(((uint64_t)n * (uint64_t)i) / (uint64_t)build_threads);
+            part_hi[i] = (uint32_t)(((uint64_t)n * (uint64_t)(i + 1)) / (uint64_t)build_threads);
+        }
+
+        memset(has_in, 0, bitmap_words * sizeof(uint64_t));
+        PermuteCtx pc;
+        pc.head = head;
+        pc.edges = edges;
+        pc.pos = pos;
+        pc.edges2 = edges2;
+        pc.order = order;
+        pc.part_lo = part_lo;
+        pc.part_hi = part_hi;
+        pc.target_mask = target_mask;
+        pc.has_in = has_in;
+        pc.n = n;
+        run_ranges(build_threads, permute_range, &pc);
+
+        for (int i = 0; i < num_queries; i++) {
+            uint32_t qs = queries[i].s, qt = queries[i].t;
+            queries[i].s = qs < n ? pos[qs] : qs;
+            queries[i].t = qt < n ? pos[qt] : qt;
+        }
+
+        free(head);
+        free(edges);
+        free(pos);
+        free(order);
+        free(part_lo);
+        free(part_hi);
+        head = head2;
+        edges = edges2;
+    }
+    free(target_mask);
 
     /* Parallel Dijkstra from a shared queue. */
     int num_threads = available_cpus();
