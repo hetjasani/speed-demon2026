@@ -1,4 +1,4 @@
-FROM gcc:14-bookworm AS builder
+FROM gcc:15@sha256:eb5e64286ad47187b32bda75c6b6916166ecb41da56559b8b09e0001748d2cce AS builder
 WORKDIR /src
 COPY b_index.cpp .
 RUN g++ -std=c++20 -O3 -flto -march=native -mavx2 -DNDEBUG -pipe -o /b_index b_index.cpp
