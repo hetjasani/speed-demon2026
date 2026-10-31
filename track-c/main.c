@@ -22,7 +22,7 @@ static RegionEntry *region_table = NULL;
 
 typedef struct {
   uint32_t hash;
-  uint32_t len_plus_1; // 0 = empty slot, >0 = occupied (len + 1)
+  uint32_t len_plus_1;
   uint32_t offset;
 } NameEntry;
 
@@ -81,7 +81,7 @@ static inline uint16_t lookup_region(uint64_t reg_id) {
       return region_table[slot].country_idx;
     slot = (slot + 1) & REGION_MASK;
   }
-  return 0; // _UNMATCHED
+  return 0;
 }
 
 static void load_regions(const char *path) {
@@ -184,15 +184,16 @@ static inline void add_name(CountryAgg *agg, const char *str, uint32_t len) {
     if (agg->names[slot].len_plus_1 == target_len_plus_1 &&
         agg->names[slot].hash == h &&
         memcmp(name_arena + agg->names[slot].offset, str, len) == 0) {
-      return; // Deduplicated!
+      return;
     }
     slot = (slot + 1) & mask;
   }
 
   if (arena_used + len > arena_cap) {
-    arena_cap = arena_cap ? arena_cap * 2 : (32 * 1024 * 1024);
-    while (arena_used + len > arena_cap) arena_cap *= 2;
-    name_arena = (char *)realloc(name_arena, arena_cap);
+    size_t new_cap = arena_cap ? (arena_cap * 2) : (32 * 1024 * 1024);
+    while (arena_used + len > new_cap) new_cap *= 2;
+    name_arena = (char *)realloc(name_arena, new_cap);
+    arena_cap = new_cap;
   }
 
   memcpy(name_arena + arena_used, str, len);

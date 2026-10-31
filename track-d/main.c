@@ -266,6 +266,80 @@ static void *worker_func(void *arg) {
 }
 
 /* ------------------------------------------------------------------------- */
+/* Node relabelling.                                                         */
+/*                                                                           */
+/* A Dijkstra search only ever touches the nodes of a ball around s. With    */
+/* ids in BFS order that ball is a narrow band of consecutive ids, so the    */
+/* distance table, the offsets and the edge lists a query reads stay in      */
+/* cache instead of being spread over the whole arrays. The answers are      */
+/* unchanged: this is just a permutation of the node ids.                    */
+/* ------------------------------------------------------------------------- */
+
+static void bfs_order(uint32_t n, const uint32_t *head, const Edge *edges,
+                      uint32_t *pos, uint32_t *order) {
+    memset(pos, 0xFF, (size_t)n * sizeof(uint32_t));
+    uint32_t start = 0, best = 0;
+    for (uint32_t u = 0; u < n; u++) {
+        uint32_t d = head[u + 1] - head[u];
+        if (d > best) { best = d; start = u; }
+    }
+    uint32_t lo = 0, hi = 1, qt = 1;
+    pos[start] = 0;
+    order[0] = start;
+    while (lo < hi) {
+        for (uint32_t i = lo; i < hi; i++) {
+            uint32_t u = order[i];
+            uint32_t e = head[u], e_end = head[u + 1];
+            for (; e < e_end; e++) {
+                uint32_t v = edges[e].v;
+                if (v < n && pos[v] == UINT32_MAX) { pos[v] = qt; order[qt++] = v; }
+            }
+        }
+        lo = hi;
+        hi = qt;
+    }
+    /* Nodes the BFS never reached go last; they are rare (isolated parts). */
+    for (uint32_t u = 0; u < n; u++)
+        if (pos[u] == UINT32_MAX) { pos[u] = qt; order[qt++] = u; }
+}
+
+typedef struct {
+    const uint32_t *head;
+    const Edge *edges;
+    const uint32_t *pos;
+    Edge *edges2;
+    const uint32_t *order;
+    const uint32_t *part_lo;
+    const uint32_t *part_hi;
+    const uint64_t *target_mask;
+    uint64_t *has_in;
+    uint32_t n;
+} PermuteCtx;
+
+static void permute_range(void *vctx, int idx) {
+    PermuteCtx *c = (PermuteCtx *)vctx;
+    uint32_t n = c->n;
+    uint32_t lo = c->part_lo[idx], hi = c->part_hi[idx];
+    /* Offsets are unchanged by the permutation, so the new edge slots of a
+     * tail depend only on that tail: every part writes a disjoint slice. */
+    uint32_t e = c->head[c->order[lo]];
+    for (uint32_t i = lo; i < hi; i++) {
+        uint32_t u = c->order[i];
+        uint32_t eu = c->head[u], eu_end = c->head[u + 1];
+        if (i + 4 < hi) __builtin_prefetch(&c->head[c->order[i + 4]], 0, 1);
+        for (; eu < eu_end; eu++) {
+            uint32_t v = c->edges[eu].v;
+            uint32_t nv = v < n ? c->pos[v] : v;
+            c->edges2[e].v = nv;
+            c->edges2[e].w = c->edges[eu].w;
+            e++;
+            if (__builtin_expect(v < n && (c->target_mask[v >> 6] & (1ULL << (v & 63))) != 0, 0))
+                c->has_in[nv >> 6] |= 1ULL << (nv & 63);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------- */
 /* Parsing.                                                                  */
 /* ------------------------------------------------------------------------- */
 
