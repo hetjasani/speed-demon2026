@@ -1,15 +1,11 @@
 # Track C: Join
 
-The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/c-join.md).
-
 ## Approach
-
-How your solution works, in plain prose.
+Our solution is written in pure C (C99/POSIX) with 0 external dependencies:
+1. **Memory-Mapped I/O:** `records.csv` is mapped into memory via `mmap` to avoid buffer copying.
+2. **Hostile CSV Lexing:** A custom parser handles Excel-dialect quotes (`""`), embedded newlines, and strips UTF-8 BOM markers.
+3. **Integer Cents:** Monetary amounts are parsed directly into signed 64-bit integer cents to prevent floating-point inaccuracies.
+4. **Hash Table & Arena:** Country aggregates and regions are stored in open-addressing hash tables with FNV-1a hashing. Unique country names are deduplicated using a lightweight chunk arena.
 
 ## Dependencies
-
-None.
-
-## With another 24 hours
-
-What you would do next.
+None (C Standard Library only).

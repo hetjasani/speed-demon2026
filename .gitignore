@@ -1,2 +1,26 @@
 .out/
 data/
+tree/
+
+# 1. Test data and generated output (NEVER upload big datasets to GitHub!)
+/data/
+/out/
+/out_ref/
+
+# 2. The temporary generators folder we cloned
+/generators-repo/
+
+# 3. Compiled C programs and object files (GitHub builds them inside Docker)
+track-c/track-c-join
+*.o
+*.out
+*.exe
+
+# 4. Rust build files (for your teammate on Track A)
+target/
+**/target/
+
+# 5. System and editor junk
+.DS_Store
+.vscode/
+.idea/
