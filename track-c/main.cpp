@@ -19,17 +19,15 @@
 
 constexpr int MAX_COUNTRIES = 1024;
 constexpr int MAX_THREADS = 16;
-constexpr size_t READ_BUF_SZ = 384 * 1024;      // 384 KB per thread
+constexpr size_t READ_BUF_SZ = 384 * 1024;      // 384 KB buffer per thread
 constexpr size_t LOCAL_FILTER_CAP = 2048;       // L1 cache resident
-constexpr size_t ARENA_SIZE = 4 * 1024 * 1024;  // 4 MB total distinct names arena
+constexpr size_t ARENA_SIZE = 4 * 1024 * 1024;  // 4 MB arena for unique names
 
-// Fast L1 filter entry
 struct FilterEntry {
     uint64_t hash;
     uint16_t country_idx;
 };
 
-// Global country name table in preallocated arena
 struct GlobalNameTable {
     std::atomic_flag lock = ATOMIC_FLAG_INIT;
     uint32_t count = 0;
@@ -37,16 +35,13 @@ struct GlobalNameTable {
     uint64_t *slots = nullptr;
 };
 
-// Simple bump-pointer arena
 static uint8_t g_arena_buf[ARENA_SIZE] __attribute__((aligned(64)));
 static std::atomic<size_t> g_arena_offset{0};
 
 static inline void *arena_alloc(size_t sz) {
-    sz = (sz + 63) & ~63ULL; // 64-byte alignment
+    sz = (sz + 63) & ~63ULL;
     size_t old = g_arena_offset.fetch_add(sz, std::memory_order_relaxed);
-    if (__builtin_expect(old + sz > ARENA_SIZE, 0)) {
-        return malloc(sz);
-    }
+    if (__builtin_expect(old + sz > ARENA_SIZE, 0)) return malloc(sz);
     return g_arena_buf + old;
 }
 
@@ -101,7 +96,6 @@ static void insert_global_name(uint16_t c_idx, uint64_t h) {
     g.lock.clear(std::memory_order_release);
 }
 
-// Region direct table
 static uint16_t *g_region_direct = nullptr;
 static uint64_t g_max_region_id = 0;
 
@@ -116,7 +110,7 @@ static std::vector<std::string> g_country_names_list;
 static int g_total_countries = 1; // 0 is _UNMATCHED
 
 static inline uint16_t lookup_region(uint64_t reg_id) {
-    if (g_region_direct) {
+    if (__builtin_expect(g_region_direct != nullptr, 1)) {
         return (reg_id <= g_max_region_id) ? g_region_direct[reg_id] : 0;
     }
     if (g_region_hash_mask != 0) {
@@ -127,7 +121,7 @@ static inline uint16_t lookup_region(uint64_t reg_id) {
             slot = (slot + 1) & g_region_hash_mask;
         }
     }
-    return 0; // _UNMATCHED
+    return 0;
 }
 
 static int get_country_idx(const char *name, size_t len) {
@@ -250,9 +244,9 @@ struct LocalScalarAgg {
     uint64_t note_bytes = 0;
 };
 
-static void parse_worker(int fd, size_t start_off, size_t end_off,
-                         std::vector<LocalScalarAgg> &local_aggs) {
-    char *buf = (char *)malloc(READ_BUF_SZ + 4096);
+static void parse_slice_worker(int fd, size_t start_off, size_t end_off,
+                              std::vector<LocalScalarAgg> &local_aggs,
+                              char *read_buf) {
     FilterEntry local_filter[LOCAL_FILTER_CAP];
     std::memset(local_filter, 0, sizeof(local_filter));
 
@@ -264,7 +258,7 @@ static void parse_worker(int fd, size_t start_off, size_t end_off,
         if (!done_reading && buf_len < READ_BUF_SZ) {
             size_t want = std::min(READ_BUF_SZ - buf_len, end_off - cur_file_off);
             if (want > 0) {
-                ssize_t got = pread(fd, buf + buf_len, want, cur_file_off);
+                ssize_t got = pread(fd, read_buf + buf_len, want, cur_file_off);
                 if (got > 0) {
                     buf_len += got;
                     cur_file_off += got;
@@ -276,11 +270,10 @@ static void parse_worker(int fd, size_t start_off, size_t end_off,
             }
         }
 
-        const char *p = buf;
-        const char *limit = buf + buf_len;
+        const char *p = read_buf;
+        const char *limit = read_buf + buf_len;
 
         while (p < limit) {
-            // Guarantee full record headroom
             if (!done_reading && (size_t)(limit - p) < 2048) {
                 break;
             }
@@ -291,43 +284,40 @@ static void parse_worker(int fd, size_t start_off, size_t end_off,
             if (p + 3 <= limit && (uint8_t)p[0] == 0xEF && (uint8_t)p[1] == 0xBB && (uint8_t)p[2] == 0xBF)
                 p += 3;
 
-            // Field 1: id
+            // Field 1: id (unbounded fast path)
             int64_t rec_id = 0;
-            while (p < limit && (uint8_t)(*p - '0') <= 9) {
-                rec_id = rec_id * 10 + (*p - '0');
-                ++p;
+            while ((uint8_t)(*p - '0') <= 9) {
+                rec_id = rec_id * 10 + (*p++ - '0');
             }
-            if (p < limit && *p == ',') ++p;
+            if (*p == ',') ++p;
 
             // Field 2: name
             uint64_t name_h = 14695981039346656037ULL;
             uint32_t name_len = 0;
-            if (p < limit && *p == '"') {
+            if (*p == '"') {
                 ++p;
-                while (p < limit) {
-                    if (*p == '"') {
-                        if (p + 1 < limit && p[1] == '"') {
+                while (true) {
+                    char c = *p++;
+                    if (c == '"') {
+                        if (*p == '"') {
                             name_h = (name_h ^ (uint8_t)'"') * 1099511628211ULL;
                             name_len++;
-                            p += 2;
-                        } else {
                             ++p;
+                        } else {
                             break;
                         }
                     } else {
-                        name_h = (name_h ^ (uint8_t)*p) * 1099511628211ULL;
+                        name_h = (name_h ^ (uint8_t)c) * 1099511628211ULL;
                         name_len++;
-                        ++p;
                     }
                 }
             } else {
-                while (p < limit && *p != ',') {
-                    name_h = (name_h ^ (uint8_t)*p) * 1099511628211ULL;
+                while (*p != ',') {
+                    name_h = (name_h ^ (uint8_t)*p++) * 1099511628211ULL;
                     name_len++;
-                    ++p;
                 }
             }
-            if (p < limit && *p == ',') ++p;
+            if (*p == ',') ++p;
 
             name_h ^= (uint64_t)name_len * 0x9e3779b97f4a7c15ULL;
             name_h ^= name_h >> 33;
@@ -335,11 +325,11 @@ static void parse_worker(int fd, size_t start_off, size_t end_off,
             name_h ^= name_h >> 33;
             if (__builtin_expect(name_h == 0, 0)) name_h = 1;
 
-            // Field 3: note (optimized with memchr)
+            // Field 3: note
             uint64_t note_len = 0;
-            if (p < limit && *p == '"') {
+            if (*p == '"') {
                 ++p;
-                while (p < limit) {
+                while (true) {
                     const char *qpos = (const char *)std::memchr(p, '"', limit - p);
                     if (!qpos) {
                         note_len += (limit - p);
@@ -358,36 +348,34 @@ static void parse_worker(int fd, size_t start_off, size_t end_off,
                 }
             } else {
                 const char *ns = p;
-                while (p < limit && *p != ',') ++p;
+                while (*p != ',') ++p;
                 note_len = (size_t)(p - ns);
             }
-            if (p < limit && *p == ',') ++p;
+            if (*p == ',') ++p;
 
             // Field 4: region_id
             uint64_t reg_id = 0;
-            while (p < limit && (uint8_t)(*p - '0') <= 9) {
-                reg_id = reg_id * 10 + (*p - '0');
-                ++p;
+            while ((uint8_t)(*p - '0') <= 9) {
+                reg_id = reg_id * 10 + (*p++ - '0');
             }
-            if (p < limit && *p == ',') ++p;
+            if (*p == ',') ++p;
 
             // Field 5: amount
             int neg = 0;
-            if (p < limit && *p == '-') {
+            if (*p == '-') {
                 neg = 1;
                 ++p;
             }
             int64_t dollars = 0;
-            while (p < limit && (uint8_t)(*p - '0') <= 9) {
-                dollars = dollars * 10 + (*p - '0');
-                ++p;
+            while ((uint8_t)(*p - '0') <= 9) {
+                dollars = dollars * 10 + (*p++ - '0');
             }
             int64_t cents = 0;
-            if (p < limit && *p == '.') {
+            if (*p == '.') {
                 ++p;
-                if (p < limit && (uint8_t)(*p - '0') <= 9) {
+                if ((uint8_t)(*p - '0') <= 9) {
                     cents = (*p++ - '0') * 10;
-                    if (p < limit && (uint8_t)(*p - '0') <= 9) {
+                    if ((uint8_t)(*p - '0') <= 9) {
                         cents += (*p++ - '0');
                     }
                 }
@@ -408,7 +396,6 @@ static void parse_worker(int fd, size_t start_off, size_t end_off,
             ca.name_bytes += name_len;
             ca.note_bytes += note_len;
 
-            // Distinct name deduplication via L1 filter + global table
             uint32_t f_slot = (uint32_t)(name_h ^ (c_idx * 0x9e3779b97f4a7c15ULL)) & (LOCAL_FILTER_CAP - 1);
             if (local_filter[f_slot].hash != name_h || local_filter[f_slot].country_idx != c_idx) {
                 local_filter[f_slot] = {name_h, c_idx};
@@ -418,13 +405,11 @@ static void parse_worker(int fd, size_t start_off, size_t end_off,
 
         size_t leftover = limit - p;
         if (leftover > 0) {
-            std::memmove(buf, p, leftover);
+            std::memmove(read_buf, p, leftover);
         }
         buf_len = leftover;
         if (done_reading && buf_len == 0) break;
     }
-
-    free(buf);
 }
 
 static void format_cents(char *buf, int64_t cents) {
@@ -432,6 +417,29 @@ static void format_cents(char *buf, int64_t cents) {
     int64_t c = std::llabs(cents);
     std::sprintf(buf, "%s%lld.%02lld", sign, (long long)(c / 100), (long long)(c % 100));
 }
+
+// Lightweight atomic synchronization barrier
+struct SpinBarrier {
+    std::atomic<int> count{0};
+    std::atomic<int> step{0};
+    int total = 0;
+
+    void init(int t) { total = t; count.store(0); step.store(0); }
+
+    void wait() {
+        int s = step.load(std::memory_order_relaxed);
+        if (count.fetch_add(1, std::memory_order_acq_rel) == total - 1) {
+            count.store(0, std::memory_order_relaxed);
+            step.fetch_add(1, std::memory_order_release);
+        } else {
+            while (step.load(std::memory_order_acquire) == s) {
+#if defined(__x86_64__)
+                _mm_pause();
+#endif
+            }
+        }
+    }
+};
 
 int main(int argc, char **argv) {
     std::string data_dir = "/data", out_dir = "/out";
@@ -461,7 +469,6 @@ int main(int argc, char **argv) {
     if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); return 1; }
     size_t file_size = (size_t)st.st_size;
 
-    // Skip CSV header
     char hbuf[1024];
     ssize_t hr = pread(fd, hbuf, sizeof(hbuf) - 1, 0);
     size_t header_end = 0;
@@ -481,83 +488,77 @@ int main(int argc, char **argv) {
         slice_offsets[i] = header_end + (i * body_size) / num_threads;
     }
 
-    // Phase 1: Count quotes in parallel for exact parity boundaries
     std::vector<size_t> slice_quotes(num_threads, 0);
-    std::vector<std::thread> quote_threads;
-    for (int t = 0; t < num_threads; ++t) {
-        quote_threads.emplace_back([&, t]() {
-            char *qbuf = (char *)malloc(READ_BUF_SZ);
-            size_t off = slice_offsets[t];
-            size_t end_off = slice_offsets[t + 1];
-            size_t qcount = 0;
-            while (off < end_off) {
-                size_t want = std::min(READ_BUF_SZ, end_off - off);
-                ssize_t got = pread(fd, qbuf, want, off);
-                if (got <= 0) break;
-                qcount += count_quotes_simd(qbuf, got);
-                off += got;
-            }
-            slice_quotes[t] = qcount;
-            free(qbuf);
-        });
-    }
-    for (auto &th : quote_threads) th.join();
-
-    // Compute quote parity prefix
-    std::vector<int> parity_at_start(num_threads, 0);
-    int cur_parity = 0;
-    for (int t = 0; t < num_threads; ++t) {
-        parity_at_start[t] = cur_parity;
-        cur_parity ^= (slice_quotes[t] & 1);
-    }
-
-    // Determine exact chunk record start boundaries
     std::vector<size_t> chunk_boundaries(num_threads + 1);
     chunk_boundaries[0] = header_end;
     chunk_boundaries[num_threads] = file_size;
 
-    for (int t = 1; t < num_threads; ++t) {
-        size_t off = slice_offsets[t];
-        char scan_buf[65536];
-        ssize_t got = pread(fd, scan_buf, sizeof(scan_buf), off);
-        int in_q = parity_at_start[t];
-        size_t record_start = off;
-        for (ssize_t i = 0; i < got; ++i) {
-            char c = scan_buf[i];
-            if (c == '"') {
-                in_q ^= 1;
-            } else if (c == '\n' && in_q == 0) {
-                record_start = off + i + 1;
-                while (record_start < file_size) {
-                    char next_c;
-                    if (pread(fd, &next_c, 1, record_start) == 1 && (next_c == '\r' || next_c == '\n')) {
-                        record_start++;
-                    } else {
-                        break;
-                    }
-                }
-                break;
-            }
-        }
-        chunk_boundaries[t] = record_start;
-    }
-
-    // Phase 2: Parse slices in parallel with zero contention
     std::vector<std::vector<LocalScalarAgg>> thread_aggs(num_threads);
     for (int t = 0; t < num_threads; ++t) {
         thread_aggs[t].resize(MAX_COUNTRIES);
     }
 
+    SpinBarrier barrier;
+    barrier.init(num_threads);
+
     std::vector<std::thread> workers;
     for (int t = 0; t < num_threads; ++t) {
         workers.emplace_back([&, t]() {
-            parse_worker(fd, chunk_boundaries[t], chunk_boundaries[t + 1], thread_aggs[t]);
+            char *buf = (char *)malloc(READ_BUF_SZ + 4096);
+
+            // Phase 1: Parallel quote scan in-place
+            size_t off = slice_offsets[t];
+            size_t end_off = slice_offsets[t + 1];
+            size_t qcount = 0;
+            while (off < end_off) {
+                size_t want = std::min(READ_BUF_SZ, end_off - off);
+                ssize_t got = pread(fd, buf, want, off);
+                if (got <= 0) break;
+                qcount += count_quotes_simd(buf, got);
+                off += got;
+            }
+            slice_quotes[t] = qcount;
+
+            barrier.wait();
+
+            // Thread 0 computes chunk boundaries without spawning new threads
+            if (t == 0) {
+                int cur_p = 0;
+                for (int i = 1; i < num_threads; ++i) {
+                    cur_p ^= (slice_quotes[i - 1] & 1);
+                    size_t s_off = slice_offsets[i];
+                    char scan_buf[65536];
+                    ssize_t got = pread(fd, scan_buf, sizeof(scan_buf), s_off);
+                    int in_q = cur_p;
+                    size_t record_start = s_off;
+                    for (ssize_t j = 0; j < got; ++j) {
+                        char c = scan_buf[j];
+                        if (c == '"') {
+                            in_q ^= 1;
+                        } else if (c == '\n' && in_q == 0) {
+                            ssize_t k = j + 1;
+                            while (k < got && (scan_buf[k] == '\r' || scan_buf[k] == '\n')) {
+                                k++;
+                            }
+                            record_start = s_off + k;
+                            break;
+                        }
+                    }
+                    chunk_boundaries[i] = record_start;
+                }
+            }
+
+            barrier.wait();
+
+            // Phase 2: High-speed record parsing using same buffer
+            parse_slice_worker(fd, chunk_boundaries[t], chunk_boundaries[t + 1], thread_aggs[t], buf);
+            free(buf);
         });
     }
+
     for (auto &th : workers) th.join();
     close(fd);
 
-    // Merge scalar aggregates across threads
     struct FinalAgg {
         int64_t count = 0;
         int64_t id_sum = 0;
