@@ -33,6 +33,46 @@ static std::vector<RegionEntry> region_table(REGION_CAP);
 static std::vector<std::string> country_names;
 static int total_countries = 1; // 0 is _UNMATCHED
 
+struct NameTable {
+    uint64_t *slots = nullptr;
+    uint32_t cap = 0;
+    uint32_t count = 0;
+};
+
+static inline void resize_name_table(NameTable &nt) {
+    uint32_t old_cap = nt.cap;
+    uint32_t new_cap = old_cap ? (old_cap * 2) : 512;
+    uint64_t *new_slots = (uint64_t *)calloc(new_cap, sizeof(uint64_t));
+    uint32_t new_mask = new_cap - 1;
+    if (nt.slots) {
+        for (uint32_t i = 0; i < old_cap; ++i) {
+            uint64_t v = nt.slots[i];
+            if (v != 0) {
+                uint32_t s = (uint32_t)(v ^ (v >> 32)) & new_mask;
+                while (new_slots[s] != 0) s = (s + 1) & new_mask;
+                new_slots[s] = v;
+            }
+        }
+        free(nt.slots);
+    }
+    nt.slots = new_slots;
+    nt.cap = new_cap;
+}
+
+static inline void add_name(NameTable &nt, uint64_t h) {
+    if (__builtin_expect((nt.count * 2) >= nt.cap, 0)) {
+        resize_name_table(nt);
+    }
+    uint32_t mask = nt.cap - 1;
+    uint32_t slot = (uint32_t)(h ^ (h >> 32)) & mask;
+    while (nt.slots[slot] != 0) {
+        if (nt.slots[slot] == h) return;
+        slot = (slot + 1) & mask;
+    }
+    nt.slots[slot] = h;
+    nt.count++;
+}
+
 struct LocalCountryAgg {
     int64_t count = 0;
     int64_t id_sum = 0;
@@ -41,7 +81,7 @@ struct LocalCountryAgg {
     int64_t amount_max = INT64_MIN;
     uint64_t name_bytes = 0;
     uint64_t note_bytes = 0;
-    std::vector<uint64_t> name_hashes;
+    NameTable names;
 };
 
 struct FinalCountryAgg {
@@ -254,6 +294,7 @@ static void parse_slice(const char *p, const char *end, std::vector<LocalCountry
         name_h ^= name_h >> 33;
         name_h *= 0xff51afd7ed558ccdULL;
         name_h ^= name_h >> 33;
+        if (__builtin_expect(name_h == 0, 0)) name_h = 1;
 
         // Field 3: note (unescaped length only)
         uint64_t note_len = 0;
@@ -327,7 +368,7 @@ static void parse_slice(const char *p, const char *end, std::vector<LocalCountry
         if (total_cents > ca.amount_max) ca.amount_max = total_cents;
         ca.name_bytes += name_len;
         ca.note_bytes += note_len;
-        ca.name_hashes.push_back(name_h);
+        add_name(ca.names, name_h);
     }
 }
 
@@ -393,13 +434,11 @@ int main(int argc, char **argv) {
 
     for (int t = 0; t < num_threads; ++t) {
         merge_threads.emplace_back([&]() {
-            std::vector<uint64_t> merged_names;
             while (true) {
                 int ci = country_cursor.fetch_add(1, std::memory_order_relaxed);
                 if (ci >= total_countries) break;
 
                 auto &fa = final_aggs[ci];
-                size_t total_names_est = 0;
                 for (int thr = 0; thr < num_threads; ++thr) {
                     const auto &la = all_thread_aggs[thr][ci];
                     if (la.count == 0) continue;
@@ -410,21 +449,25 @@ int main(int argc, char **argv) {
                     if (la.amount_max > fa.amount_max) fa.amount_max = la.amount_max;
                     fa.name_bytes += la.name_bytes;
                     fa.note_bytes += la.note_bytes;
-                    total_names_est += la.name_hashes.size();
                 }
 
                 if (fa.count == 0) continue;
 
-                merged_names.clear();
-                merged_names.reserve(total_names_est);
+                NameTable final_names;
                 for (int thr = 0; thr < num_threads; ++thr) {
-                    const auto &la = all_thread_aggs[thr][ci];
-                    if (!la.name_hashes.empty()) {
-                        merged_names.insert(merged_names.end(), la.name_hashes.begin(), la.name_hashes.end());
+                    auto &la_names = all_thread_aggs[thr][ci].names;
+                    if (la_names.slots) {
+                        for (uint32_t k = 0; k < la_names.cap; ++k) {
+                            if (la_names.slots[k] != 0) {
+                                add_name(final_names, la_names.slots[k]);
+                            }
+                        }
+                        free(la_names.slots);
+                        la_names.slots = nullptr;
                     }
                 }
-                std::sort(merged_names.begin(), merged_names.end());
-                fa.names_count = (uint32_t)(std::unique(merged_names.begin(), merged_names.end()) - merged_names.begin());
+                fa.names_count = final_names.count;
+                if (final_names.slots) free(final_names.slots);
             }
         });
     }
