@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #if defined(__SSE4_2__)
 #include <x86intrin.h>
@@ -17,6 +18,7 @@
 #define REGION_TABLE_CAP  1048576   // 1M slots (16 MB static BSS)
 #define MAX_COUNTRIES     1024
 #define NAME_INIT_CAP     256
+#define MAX_CHUNKS        512
 
 typedef struct ArenaBlock {
     struct ArenaBlock *next;
@@ -119,7 +121,7 @@ static int get_or_create_country_idx(const char *name, Arena *arena) {
     return idx;
 }
 
-static inline void thread_country_add_name(ThreadCountry *c, const char *name, size_t len, Arena *arena) {
+static inline void thread_country_add_name(ThreadCountry *c, const char *name, size_t len, int is_escaped, Arena *arena) {
     if (c->last_name_len == len && c->last_name && memcmp(c->last_name, name, len) == 0) {
         return;
     }
@@ -150,7 +152,7 @@ static inline void thread_country_add_name(ThreadCountry *c, const char *name, s
             c->names_table[slot].len == len &&
             memcmp(c->names_table[slot].str, name, len) == 0) {
             c->last_name = c->names_table[slot].str;
-            c->last_name_len = len;
+            c->last_name_len = (uint32_t)len;
             return;
         }
         slot = (slot + 1) & mask;
@@ -158,13 +160,13 @@ static inline void thread_country_add_name(ThreadCountry *c, const char *name, s
 
     c->names_table[slot].len = (uint32_t)len;
     c->names_table[slot].hash = h;
-    c->names_table[slot].str = arena_alloc_str(arena, name, len);
+    c->names_table[slot].str = is_escaped ? arena_alloc_str(arena, name, len) : name;
     c->last_name = c->names_table[slot].str;
     c->last_name_len = (uint32_t)len;
     c->names_count++;
 }
 
-static inline void final_country_add_name(FinalCountry *c, const char *name, size_t len, Arena *arena) {
+static inline void final_country_add_name(FinalCountry *c, const char *name, size_t len) {
     if (__builtin_expect(!c->names_table, 0)) {
         c->names_cap = NAME_INIT_CAP * 2;
         c->names_table = (NameEntry *)calloc(c->names_cap, sizeof(NameEntry));
@@ -198,7 +200,7 @@ static inline void final_country_add_name(FinalCountry *c, const char *name, siz
 
     c->names_table[slot].len = (uint32_t)len;
     c->names_table[slot].hash = h;
-    c->names_table[slot].str = arena_alloc_str(arena, name, len);
+    c->names_table[slot].str = name;
     c->names_count++;
 }
 
@@ -262,143 +264,159 @@ static void load_regions(const char *path, Arena *arena) {
 typedef struct {
     const char *start;
     const char *end;
+} Chunk;
+
+static Chunk chunks[MAX_CHUNKS];
+static int total_chunks = 0;
+static atomic_int next_chunk_idx = 0;
+
+typedef struct {
     ThreadCountry country_list[MAX_COUNTRIES];
     Arena arena;
 } ThreadContext;
 
 static void* worker_thread(void *arg) {
     ThreadContext *ctx = (ThreadContext *)arg;
-    const char *p = ctx->start;
-    const char *end = ctx->end;
 
     for (int i = 0; i < total_countries; i++) {
         ctx->country_list[i].amount_min = INT64_MAX;
         ctx->country_list[i].amount_max = INT64_MIN;
     }
 
-    char name_unescape_buf[65536];
+    char name_unescape_buf[4096];
     int64_t last_reg_id = -1;
     int32_t last_c_idx = -1;
 
-    while (p < end) {
-        while (p < end && (*p == '\r' || *p == '\n')) p++;
-        if (p >= end) break;
-        if (p + 2 < end && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;
-        if (p >= end) break;
+    while (1) {
+        int idx = atomic_fetch_add_explicit(&next_chunk_idx, 1, memory_order_relaxed);
+        if (idx >= total_chunks) break;
 
-        // Field 0: id
-        int64_t id = 0;
-        while (p < end && *p >= '0' && *p <= '9') id = id * 10 + (*p++ - '0');
-        if (p < end && *p == ',') p++;
+        const char *p = chunks[idx].start;
+        const char *end = chunks[idx].end;
 
-        // Field 1: name
-        const char *name_ptr = "";
-        size_t name_len = 0;
-        if (p < end && *p == '"') {
-            p++;
-            const char *start = p;
-            int has_escapes = 0;
-            while (p < end) {
-                if (*p == '"') {
-                    if (p + 1 < end && *(p + 1) == '"') {
-                        has_escapes = 1;
-                        p += 2;
-                    } else {
-                        break;
-                    }
-                } else {
-                    p++;
-                }
-            }
-            if (!has_escapes) {
-                name_ptr = start;
-                name_len = p - start;
-            } else {
-                const char *s = start;
-                char *d = name_unescape_buf;
-                while (s < p) {
-                    if (*s == '"' && *(s + 1) == '"') {
-                        *d++ = '"';
-                        s += 2;
-                    } else {
-                        *d++ = *s++;
-                    }
-                }
-                name_ptr = name_unescape_buf;
-                name_len = d - name_unescape_buf;
-            }
-            if (p < end && *p == '"') p++;
+        while (p < end) {
+            while (p < end && (*p == '\r' || *p == '\n')) p++;
+            if (p >= end) break;
+            if (p + 2 < end && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;
+            if (p >= end) break;
+
+            // Field 0: id
+            int64_t id = 0;
+            while (p < end && *p >= '0' && *p <= '9') id = id * 10 + (*p++ - '0');
             if (p < end && *p == ',') p++;
-        } else {
-            const char *start = p;
-            while (p < end && *p != ',') p++;
-            name_ptr = start;
-            name_len = p - start;
-            if (p < end && *p == ',') p++;
-        }
 
-        // Field 2: note
-        size_t note_len = 0;
-        if (p < end && *p == '"') {
-            p++;
-            while (p < end) {
-                if (*p == '"') {
-                    if (p + 1 < end && *(p + 1) == '"') {
-                        note_len++;
-                        p += 2;
+            // Field 1: name
+            const char *name_ptr = "";
+            size_t name_len = 0;
+            int is_escaped = 0;
+
+            if (p < end && *p == '"') {
+                p++;
+                const char *start = p;
+                int has_escapes = 0;
+                while (p < end) {
+                    if (*p == '"') {
+                        if (p + 1 < end && *(p + 1) == '"') {
+                            has_escapes = 1;
+                            p += 2;
+                        } else {
+                            break;
+                        }
                     } else {
                         p++;
-                        break;
                     }
-                } else {
-                    note_len++;
-                    p++;
                 }
+                if (!has_escapes) {
+                    name_ptr = start;
+                    name_len = p - start;
+                } else {
+                    is_escaped = 1;
+                    const char *s = start;
+                    char *d = name_unescape_buf;
+                    while (s < p) {
+                        if (*s == '"' && *(s + 1) == '"') {
+                            *d++ = '"';
+                            s += 2;
+                        } else {
+                            *d++ = *s++;
+                        }
+                    }
+                    name_ptr = name_unescape_buf;
+                    name_len = d - name_unescape_buf;
+                }
+                if (p < end && *p == '"') p++;
+                if (p < end && *p == ',') p++;
+            } else {
+                const char *start = p;
+                while (p < end && *p != ',') p++;
+                name_ptr = start;
+                name_len = p - start;
+                if (p < end && *p == ',') p++;
             }
+
+            // Field 2: note
+            size_t note_len = 0;
+            if (p < end && *p == '"') {
+                p++;
+                while (p < end) {
+                    if (*p == '"') {
+                        if (p + 1 < end && *(p + 1) == '"') {
+                            note_len++;
+                            p += 2;
+                        } else {
+                            p++;
+                            break;
+                        }
+                    } else {
+                        note_len++;
+                        p++;
+                    }
+                }
+                if (p < end && *p == ',') p++;
+            } else {
+                const char *start = p;
+                while (p < end && *p != ',') p++;
+                note_len = p - start;
+                if (p < end && *p == ',') p++;
+            }
+
+            // Field 3: region_id
+            int64_t region_id = 0;
+            while (p < end && *p >= '0' && *p <= '9') region_id = region_id * 10 + (*p++ - '0');
             if (p < end && *p == ',') p++;
-        } else {
-            const char *start = p;
-            while (p < end && *p != ',') p++;
-            note_len = p - start;
-            if (p < end && *p == ',') p++;
+
+            // Field 4: amount
+            int sign = 1;
+            if (p < end && *p == '"') p++;
+            if (p < end && *p == '-') { sign = -1; p++; }
+            int64_t cents = 0;
+            while (p < end && *p >= '0' && *p <= '9') cents = cents * 10 + (*p++ - '0');
+            if (p < end && *p == '.') p++;
+            cents = cents * 100 + (p[0] - '0') * 10 + (p[1] - '0');
+            p += 2;
+            if (sign < 0) cents = -cents;
+            if (p < end && *p == '"') p++;
+            while (p < end && (*p == '\r' || *p == '\n')) p++;
+
+            int32_t c_idx;
+            if (__builtin_expect(region_id == last_reg_id, 1)) {
+                c_idx = last_c_idx;
+            } else {
+                c_idx = lookup_region(region_id);
+                last_reg_id = region_id;
+                last_c_idx = c_idx;
+            }
+
+            ThreadCountry *c = &ctx->country_list[c_idx];
+            c->count++;
+            c->id_sum += id;
+            c->amount_sum += cents;
+            if (cents < c->amount_min) c->amount_min = cents;
+            if (cents > c->amount_max) c->amount_max = cents;
+            c->name_bytes += name_len;
+            c->note_bytes += note_len;
+            thread_country_add_name(c, name_ptr, name_len, is_escaped, &ctx->arena);
         }
-
-        // Field 3: region_id
-        int64_t region_id = 0;
-        while (p < end && *p >= '0' && *p <= '9') region_id = region_id * 10 + (*p++ - '0');
-        if (p < end && *p == ',') p++;
-
-        // Field 4: amount
-        int sign = 1;
-        if (p < end && *p == '"') p++;
-        if (p < end && *p == '-') { sign = -1; p++; }
-        int64_t cents = 0;
-        while (p < end && *p >= '0' && *p <= '9') cents = cents * 10 + (*p++ - '0');
-        if (p < end && *p == '.') p++;
-        cents = cents * 100 + (p[0] - '0') * 10 + (p[1] - '0');
-        p += 2;
-        if (sign < 0) cents = -cents;
-        if (p < end && *p == '"') p++;
-        while (p < end && (*p == '\r' || *p == '\n')) p++;
-
-        int32_t c_idx;
-        if (__builtin_expect(region_id == last_reg_id, 1)) {
-            c_idx = last_c_idx;
-        } else {
-            c_idx = lookup_region(region_id);
-            last_reg_id = region_id;
-            last_c_idx = c_idx;
-        }
-
-        ThreadCountry *c = &ctx->country_list[c_idx];
-        c->count++;
-        c->id_sum += id;
-        c->amount_sum += cents;
-        if (cents < c->amount_min) c->amount_min = cents;
-        if (cents > c->amount_max) c->amount_max = cents;
-        c->name_bytes += name_len;
-        c->note_bytes += note_len;
-        thread_country_add_name(c, name_ptr, name_len, &ctx->arena);
     }
     return NULL;
 }
@@ -440,50 +458,49 @@ int main(int argc, char **argv) {
     struct stat st;
     fstat(fd, &st);
     size_t file_size = st.st_size;
-    const char *p = (const char *)mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
+    const char *p = (const char *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     const char *end = p + file_size;
 
-    posix_madvise((void *)p, file_size, POSIX_MADV_WILLNEED | POSIX_MADV_SEQUENTIAL);
+    posix_madvise((void *)p, file_size, POSIX_MADV_SEQUENTIAL);
 
     const char *p_rec = p;
     if (p_rec + 2 < end && (unsigned char)p_rec[0] == 0xEF && (unsigned char)p_rec[1] == 0xBB && (unsigned char)p_rec[2] == 0xBF) p_rec += 3;
     while (p_rec < end && *p_rec != '\n') p_rec++;
     if (p_rec < end && *p_rec == '\n') p_rec++;
 
-    int num_threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    if (num_threads > 12) num_threads = 12;
-    if (num_threads < 1) num_threads = 1;
+    // Split into ~128 fine-grained chunks for dynamic work stealing
+    size_t target_chunk_size = (file_size - (p_rec - p)) / 128;
+    if (target_chunk_size < 512 * 1024) target_chunk_size = 512 * 1024;
 
-    const char *chunk_starts[MAX_THREADS];
-    const char *chunk_ends[MAX_THREADS];
-
-    chunk_starts[0] = p_rec;
-    size_t total_bytes = end - p_rec;
-    size_t stride = total_bytes / num_threads;
-
-    int in_quote = 0;
     const char *scan = p_rec;
-    int t = 1;
-    const char *target = p_rec + stride;
+    const char *chunk_start = p_rec;
+    int in_quote = 0;
 
-    while (scan < end && t < num_threads) {
+    while (scan < end && total_chunks < MAX_CHUNKS - 1) {
         if (*scan == '"') {
             in_quote = !in_quote;
         } else if (*scan == '\n' && !in_quote) {
-            if (scan >= target) {
+            if ((size_t)(scan - chunk_start) >= target_chunk_size) {
                 const char *next = scan + 1;
                 if (next + 2 < end && (unsigned char)next[0] == 0xEF && (unsigned char)next[1] == 0xBB && (unsigned char)next[2] == 0xBF)
                     next += 3;
-                chunk_starts[t] = next;
-                chunk_ends[t - 1] = next;
-                t++;
-                target = p_rec + (size_t)t * stride;
+                chunks[total_chunks].start = chunk_start;
+                chunks[total_chunks].end = next;
+                total_chunks++;
+                chunk_start = next;
+                scan = next;
+                continue;
             }
         }
         scan++;
     }
-    num_threads = t;
-    chunk_ends[num_threads - 1] = end;
+    chunks[total_chunks].start = chunk_start;
+    chunks[total_chunks].end = end;
+    total_chunks++;
+
+    int num_threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (num_threads > 14) num_threads = 14;
+    if (num_threads < 1) num_threads = 1;
 
     pthread_t threads[MAX_THREADS];
     ThreadContext *contexts = (ThreadContext *)calloc(num_threads, sizeof(ThreadContext));
@@ -493,8 +510,6 @@ int main(int argc, char **argv) {
     pthread_attr_setstacksize(&attr, 256 * 1024);
 
     for (int i = 0; i < num_threads; i++) {
-        contexts[i].start = chunk_starts[i];
-        contexts[i].end = chunk_ends[i];
         pthread_create(&threads[i], &attr, worker_thread, &contexts[i]);
     }
     pthread_attr_destroy(&attr);
@@ -502,9 +517,6 @@ int main(int argc, char **argv) {
     for (int i = 0; i < num_threads; i++) {
         pthread_join(threads[i], NULL);
     }
-
-    munmap((void *)p, file_size);
-    close(fd);
 
     FinalCountry final_countries[MAX_COUNTRIES];
     memset(final_countries, 0, sizeof(final_countries));
@@ -529,7 +541,7 @@ int main(int argc, char **argv) {
             if (src->names_table) {
                 for (uint32_t s = 0; s < src->names_cap; s++) {
                     if (src->names_table[s].str) {
-                        final_country_add_name(final, src->names_table[s].str, src->names_table[s].len, &main_arena);
+                        final_country_add_name(final, src->names_table[s].str, src->names_table[s].len);
                     }
                 }
             }
@@ -565,6 +577,9 @@ int main(int argc, char **argv) {
                 (unsigned long long)c->name_bytes, (unsigned long long)c->note_bytes);
     }
     fclose(out);
+
+    munmap((void *)p, file_size);
+    close(fd);
     free(contexts);
     return 0;
 }
