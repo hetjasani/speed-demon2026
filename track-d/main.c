@@ -138,6 +138,8 @@ static void *chunk_worker(void *arg) {
         }
         i = j + 1;
     }
+    /* Drop processed chunk pages from RSS per blueprint */
+    if (got > 0) madvise(buf, (size_t)got, MADV_DONTNEED);
     free(buf);
     return NULL;
 }
@@ -214,21 +216,52 @@ int main(int argc, char **argv) {
     FILE *out = fopen(out_path, "wb");
     if (!out) return 1;
 
-    /* For brevity, write a single aggregated line; full version writes per-country. */
-    int64_t total_count = 0, total_id = 0, total_amount = 0;
-    int64_t global_min = 0, global_max = 0;
+    /* Full per-country merge: collect from all threads, write aggregates */
+    HashMap final;
+    hm_init(&final);
     for (int t = 0; t < num_threads; t++) {
         HashMap *h = &maps[t];
         for (uint32_t i = 0; i < h->cap; i++) {
             if (h->table[i].key == 0) continue;
-            total_count += h->table[i].count;
-            total_id += h->table[i].id_sum;
-            total_amount += h->table[i].amount_sum;
+            uint32_t country = h->table[i].key;
+            int64_t id_sum = h->table[i].id_sum;
+            int64_t amount_sum = h->table[i].amount_sum;
+            int64_t count = h->table[i].count;
+            int64_t mn = h->table[i].min;
+            int64_t mx = h->table[i].max;
+            /* Merge into final: find or create */
+            uint32_t idx = hash_u32(country) & (final.cap - 1);
+            while (final.table[idx].key != 0 && final.table[idx].key != country) idx = (idx + 1) & (final.cap - 1);
+            if (final.table[idx].key == 0) {
+                final.table[idx].key = country;
+                final.table[idx].count = 0;
+                final.table[idx].id_sum = 0;
+                final.table[idx].amount_sum = 0;
+                final.table[idx].min = id_sum;
+                final.table[idx].max = id_sum;
+                final.used++;
+            }
+            final.table[idx].count += count;
+            final.table[idx].id_sum += id_sum;
+            final.table[idx].amount_sum += amount_sum;
+            if (mn < final.table[idx].min) final.table[idx].min = mn;
+            if (mx > final.table[idx].max) final.table[idx].max = mx;
         }
     }
-    fprintf(out, "count=%lld id_sum=%lld amount_sum=%lld\n", (long long)total_count, (long long)total_id, (long long)total_amount);
+    fprintf(out, "country\tcount\tid_sum\tamount_sum\tmin_id\tmax_id\n");
+    for (uint32_t i = 0; i < final.cap; i++) {
+        if (final.table[i].key == 0) continue;
+        fprintf(out, "%u\t%lld\t%lld\t%lld\t%lld\t%lld\n",
+                final.table[i].key,
+                (long long)final.table[i].count,
+                (long long)final.table[i].id_sum,
+                (long long)final.table[i].amount_sum,
+                (long long)final.table[i].min,
+                (long long)final.table[i].max);
+    }
     fclose(out);
 
+    hm_free(&final);
     for (int t = 0; t < num_threads; t++) hm_free(&maps[t]);
     free(contexts);
     free(maps);
