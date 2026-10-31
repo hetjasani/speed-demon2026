@@ -42,6 +42,7 @@ typedef struct {
 typedef struct {
     int64_t d;
     uint32_t u;
+    uint32_t e; /* first edge of u's row, carried so the pop needs no extra load */
 } HeapNode;
 
 #define RADIX_BUCKETS 65
@@ -73,7 +74,7 @@ static inline unsigned rh_bucket(int64_t key, int64_t last) {
     return x ? (unsigned)(64 - __builtin_clzll(x)) : 0u;
 }
 
-static inline void rh_push(RadixHeap *h, int64_t key, uint32_t u) {
+static inline void rh_push(RadixHeap *h, int64_t key, uint32_t u, uint32_t e) {
     unsigned bi = rh_bucket(key, h->last);
     uint32_t k = h->n[bi];
     if (__builtin_expect(k == h->cap[bi], 0)) {
@@ -88,6 +89,7 @@ static inline void rh_push(RadixHeap *h, int64_t key, uint32_t u) {
     }
     h->b[bi][k].d = key;
     h->b[bi][k].u = u;
+    h->b[bi][k].e = e;
     h->n[bi] = k + 1;
     h->total++;
 }
@@ -117,7 +119,7 @@ static inline HeapNode rh_pop(RadixHeap *h) {
          * so these pushes never touch bucket i (whose buffer is `arr`). */
         for (uint32_t k = 0; k < cnt; k++) {
             if (k == mi) continue;
-            rh_push(h, arr[k].d, arr[k].u);
+            rh_push(h, arr[k].d, arr[k].u, arr[k].e);
         }
         return ret;
     }
@@ -135,13 +137,34 @@ static inline HeapNode rh_pop(RadixHeap *h) {
 /* neighbour loop touches one cache line per node instead of two.            */
 /* ------------------------------------------------------------------------- */
 
+/* Fast distance table: one 32-bit word per node, split into a 24-bit distance
+ * and an 8-bit generation stamp. That halves the footprint of the hottest array
+ * in the query loop -- the ball a query touches is ~48 K ids, so the table goes
+ * from 384 KB to 192 KB per query and eight of them fit in the L2/L3 instead of
+ * thrashing it. 24 bits hold 16.7 M, far above the ~15 K distances this kind of
+ * graph produces, and any query whose answer does not fit is redone on the wide
+ * (64-bit) table below, so the fast path is exact, not approximate. */
+#define FAST_BITS 24
+#define FAST_LIMIT ((int64_t)1 << FAST_BITS)
+#define GO_WIDE INT64_MIN
+
+typedef struct {
+    uint32_t *tag;
+    uint32_t mask;
+    uint32_t epoch;
+    uint32_t epoch_limit;
+} DistTable;
+
+/* Wide table: same encoding with 64 bits, used only for the handful of queries
+ * whose distance is at least FAST_LIMIT (paths over the deliberately huge
+ * weights). */
 typedef struct {
     uint64_t *tag;
     uint64_t mask;
     int shift;
     uint32_t epoch;
-    uint32_t epoch_limit; /* stamps run 1..epoch_limit-1, then the table is cleared */
-} DistTable;
+    uint32_t epoch_limit;
+} WideTable;
 
 /* Number of low bits that hold a distance: every candidate is below
  * n * 2^32, so that many bits plus one of slack always suffice. */
@@ -162,6 +185,60 @@ static int64_t shortest(uint32_t s, uint32_t t, uint32_t n,
                         DistTable *dt, RadixHeap *heap) {
     uint32_t cur = dt->epoch + 1;
     if (__builtin_expect(cur >= dt->epoch_limit, 0)) {
+        memset(dt->tag, 0, (size_t)n * sizeof(uint32_t));
+        cur = 1;
+    }
+    dt->epoch = cur;
+
+    const uint32_t stamp = cur << FAST_BITS;
+    const uint32_t mask = dt->mask;
+    uint32_t *tag = dt->tag;
+
+    rh_reset(heap);
+    tag[s] = stamp; /* distance 0 */
+    rh_push(heap, 0, s, head[s]);
+
+    while (heap->total) {
+        HeapNode top = rh_pop(heap);
+        int64_t d = top.d;
+        uint32_t u = top.u;
+
+        if (__builtin_expect((tag[u] & mask) != (uint32_t)d, 0)) continue; /* stale */
+        if (u == t) return d;
+
+        uint32_t e = top.e;
+        uint32_t e_end = head[u + 1];
+        for (; e < e_end; e++) {
+            if (PF && e + PF < e_end) __builtin_prefetch(&tag[edges[e + PF].v], 1, 3);
+            uint32_t v = edges[e].v;
+            int64_t nd = d + (int64_t)edges[e].w;
+            /* A candidate at or above FAST_LIMIT cannot be on a path shorter
+             * than FAST_LIMIT, so dropping it leaves every distance below the
+             * limit exact. If the target never falls below the limit the
+             * caller redoes the query on the wide table. */
+            if (__builtin_expect(nd >= FAST_LIMIT, 0)) continue;
+            uint32_t x = tag[v];
+            if ((x >> FAST_BITS) != cur) {
+                tag[v] = stamp | (uint32_t)nd;
+                __builtin_prefetch(&head[v], 0, 3);
+                rh_push(heap, nd, v, head[v]);
+            } else if (nd < (int64_t)(x & mask)) {
+                tag[v] = stamp | (uint32_t)nd;
+                __builtin_prefetch(&head[v], 0, 3);
+                rh_push(heap, nd, v, head[v]);
+            }
+        }
+    }
+    return GO_WIDE;
+}
+
+/* The same search on the wide table. Only reached when the fast table cannot
+ * represent the answer, which on a real graph is a handful of queries. */
+static int64_t shortest_wide(uint32_t s, uint32_t t, uint32_t n,
+                             const uint32_t *head, const Edge *edges,
+                             WideTable *dt, RadixHeap *heap) {
+    uint32_t cur = dt->epoch + 1;
+    if (__builtin_expect(cur >= dt->epoch_limit, 0)) {
         memset(dt->tag, 0, (size_t)n * sizeof(uint64_t));
         cur = 1;
     }
@@ -173,18 +250,18 @@ static int64_t shortest(uint32_t s, uint32_t t, uint32_t n,
     uint64_t *tag = dt->tag;
 
     rh_reset(heap);
-    tag[s] = stamp; /* distance 0 */
-    rh_push(heap, 0, s);
+    tag[s] = stamp;
+    rh_push(heap, 0, s, head[s]);
 
     while (heap->total) {
         HeapNode top = rh_pop(heap);
         int64_t d = top.d;
         uint32_t u = top.u;
 
-        if (__builtin_expect((int64_t)(tag[u] & mask) != d, 0)) continue; /* stale */
+        if (__builtin_expect((int64_t)(tag[u] & mask) != d, 0)) continue;
         if (u == t) return d;
 
-        uint32_t e = head[u];
+        uint32_t e = top.e;
         uint32_t e_end = head[u + 1];
         for (; e < e_end; e++) {
             if (PF && e + PF < e_end) __builtin_prefetch(&tag[edges[e + PF].v], 1, 3);
@@ -193,10 +270,10 @@ static int64_t shortest(uint32_t s, uint32_t t, uint32_t n,
             uint64_t x = tag[v];
             if ((x >> shift) != cur) {
                 tag[v] = stamp | (uint64_t)nd;
-                rh_push(heap, nd, v);
+                rh_push(heap, nd, v, head[v]);
             } else if (nd < (int64_t)(x & mask)) {
                 tag[v] = stamp | (uint64_t)nd;
-                rh_push(heap, nd, v);
+                rh_push(heap, nd, v, head[v]);
             }
         }
     }
@@ -215,19 +292,44 @@ typedef struct {
 
 static atomic_int global_query_idx = 0;
 
+/* The wide table is shared and only ever used inside the lock: queries that
+ * overflow 24 bits are rare enough (six in 2000 here) that serialising them
+ * costs less than a 64-bit table per thread. */
+static WideTable wide;
+static pthread_mutex_t wide_mu = PTHREAD_MUTEX_INITIALIZER;
+static int wide_ready;
+
+static int64_t shortest_whole(uint32_t s, uint32_t t,
+                              const WorkerContext *ctx, RadixHeap *heap) {
+    uint32_t n = ctx->n;
+    pthread_mutex_lock(&wide_mu);
+    if (!wide_ready) {
+        wide.tag = (uint64_t *)calloc((size_t)n + 1, sizeof(uint64_t));
+        if (!wide.tag) {
+            fputs("out of memory\n", stderr);
+            exit(1);
+        }
+        wide.mask = ((uint64_t)1 << ctx->dbits) - 1;
+        wide.shift = ctx->dbits;
+        wide.epoch = 0;
+        uint64_t lim = (uint64_t)1 << ctx->dbits;
+        wide.epoch_limit = lim > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)lim;
+        wide_ready = 1;
+    }
+    int64_t ans = shortest_wide(s, t, n, ctx->head, ctx->edges, &wide, heap);
+    pthread_mutex_unlock(&wide_mu);
+    return ans;
+}
+
 static void *worker_func(void *arg) {
     WorkerContext *ctx = (WorkerContext *)arg;
     uint32_t n = ctx->n;
 
     DistTable dt;
-    dt.tag = (uint64_t *)calloc((size_t)n + 1, sizeof(uint64_t));
-    dt.mask = ((uint64_t)1 << ctx->dbits) - 1;
-    dt.shift = ctx->dbits;
+    dt.tag = (uint32_t *)calloc((size_t)n + 1, sizeof(uint32_t));
+    dt.mask = (uint32_t)FAST_LIMIT - 1;
     dt.epoch = 0;
-    {
-        uint64_t lim = (uint64_t)1 << ctx->dbits;
-        dt.epoch_limit = lim > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)lim;
-    }
+    dt.epoch_limit = 1u << (32 - FAST_BITS);
     if (!dt.tag) {
         fputs("out of memory\n", stderr);
         exit(1);
@@ -256,6 +358,8 @@ static void *worker_func(void *arg) {
             ans = -1;
         } else {
             ans = shortest(s, t, n, ctx->head, ctx->edges, &dt, &heap);
+            if (__builtin_expect(ans == GO_WIDE, 0))
+                ans = shortest_whole(s, t, ctx, &heap);
         }
         ctx->queries[q].ans = ans;
     }
@@ -422,6 +526,22 @@ static inline const char *skip_line(const char *p, const char *end) {
     return p < end ? p + 1 : p;
 }
 
+/* First offset at or after `pos` that starts a new line. Used to keep graph
+ * text windows line-aligned, so no edge line is ever split in two. */
+static size_t line_after(int fd, size_t pos, size_t file_size) {
+    char buf[4096];
+    while (pos < file_size) {
+        size_t want = file_size - pos;
+        if (want > sizeof(buf)) want = sizeof(buf);
+        ssize_t got = pread(fd, buf, want, (off_t)pos);
+        if (got <= 0) return file_size;
+        const char *nl = (const char *)memchr(buf, '\n', (size_t)got);
+        if (nl) return pos + (size_t)(nl - buf) + 1;
+        pos += (size_t)got;
+    }
+    return file_size;
+}
+
 /* Number of CPUs this process may run on (respects a cpuset/affinity mask). */
 static int available_cpus(void) {
     cpu_set_t set;
@@ -524,8 +644,8 @@ static void build_range(void *vctx, int idx) {
     uint32_t *tv = b->tv + (size_t)idx * b->tmp_cap;
     uint32_t *tw = b->tw + (size_t)idx * b->tmp_cap;
     uint32_t cap = b->tmp_cap;
-    uint32_t i = 0;
-    for (; i < b->m && p < end; i++) {
+    uint32_t i = b->tmp_count[idx]; /* continues across text windows */
+    for (; p < end; i++) {
         while (p < end && (unsigned)(*p - '0') > 9) p++;
         if (p >= end) break;
         uint32_t u, v, w;
@@ -667,20 +787,25 @@ int main(int argc, char **argv) {
         return 1;
     }
     size_t file_size = (size_t)st.st_size;
-    const char *base = (const char *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (base == MAP_FAILED) {
+    /* Only the file header is mapped to begin with: the edge text is consumed
+     * a window at a time below, because mapping the whole ~90 MB at once would
+     * set the peak RSS for the run. */
+    size_t hdr_len = file_size < 4096 ? file_size : 4096;
+    const char *hdr = (const char *)mmap(NULL, hdr_len, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (hdr == MAP_FAILED) {
         close(fd);
         return 1;
     }
-    posix_madvise((void *)base, file_size, POSIX_MADV_SEQUENTIAL);
-    const char *end = base + file_size;
+    const char *hend = hdr + hdr_len;
 
     uint32_t n = 0, m = 0;
-    const char *p = parse_u32(base, end, &n);
-    while (p < end && (*p == ' ' || *p == '\t')) p++;
-    p = parse_u32(p, end, &m);
-    p = skip_line(p, end);
-    const char *edges_start = p;
+    const char *p = parse_u32(hdr, hend, &n);
+    while (p < hend && (*p == ' ' || *p == '\t')) p++;
+    p = parse_u32(p, hend, &m);
+    p = skip_line(p, hend);
+    size_t text_off = (size_t)(p - hdr);
+    munmap((void *)hdr, hdr_len);
+
 
     size_t bitmap_words = (size_t)((n + 63) >> 6);
     if (bitmap_words == 0) bitmap_words = 1;
@@ -702,21 +827,6 @@ int main(int argc, char **argv) {
     if (build_threads < 1) build_threads = 1;
 
     Range ranges[MAX_BUILD_THREADS];
-    {
-        size_t len = (size_t)(end - edges_start);
-        const char *prev = edges_start;
-        ranges[0].start = edges_start;
-        for (int i = 1; i < build_threads; i++) {
-            const char *q = edges_start + (len * (size_t)i) / (size_t)build_threads;
-            if (q < prev) q = prev;
-            q = skip_line(q, end); /* start chunks on a line boundary */
-            if (q < prev) q = prev;
-            ranges[i - 1].end = q;
-            ranges[i].start = q;
-            prev = q;
-        }
-        ranges[build_threads - 1].end = end;
-    }
 
     BuildCtx b;
     memset(&b, 0, sizeof(b));
@@ -747,11 +857,45 @@ int main(int argc, char **argv) {
         if (!b.inbits[i]) return 1;
     }
 
-    /* Pass 1: parse the graph once. */
-    run_ranges(build_threads, build_range, &b);
+    /* Pass 1: parse the graph text, one window at a time. Each window is
+     * extended to a line break so no line is ever split across two windows. */
+    {
+        const size_t WIN = (size_t)32 << 20;
+        size_t off = text_off;
+        while (off < file_size) {
+            size_t wend = off + WIN;
+            if (wend >= file_size) wend = file_size;
+            else wend = line_after(fd, wend, file_size);
+            size_t wlen = wend - off;
+            /* mmap needs a page-aligned file offset, so map from the start of
+             * the page and skip the few bytes before the window. */
+            size_t page = (size_t)sysconf(_SC_PAGESIZE);
+            size_t map_off = off & ~(page - 1);
+            size_t delta = off - map_off;
+            const char *wbase = (const char *)mmap(NULL, wlen + delta, PROT_READ,
+                                                  MAP_PRIVATE, fd, (off_t)map_off);
+            if (wbase == MAP_FAILED) return 1;
+            const char *w = wbase + delta;
+            const char *wendp = w + wlen;
 
-    /* The text is no longer needed: everything comes from the parsed rows. */
-    munmap((void *)base, file_size);
+            ranges[0].start = w;
+            const char *prev = w;
+            for (int i = 1; i < build_threads; i++) {
+                const char *q = w + (wlen * (size_t)i) / (size_t)build_threads;
+                if (q < prev) q = prev;
+                q = skip_line(q, wendp); /* start chunks on a line boundary */
+                if (q < prev) q = prev;
+                ranges[i - 1].end = q;
+                ranges[i].start = q;
+                prev = q;
+            }
+            ranges[build_threads - 1].end = wendp;
+
+            run_ranges(build_threads, build_range, &b);
+            munmap((void *)wbase, wlen + delta);
+            off = wend;
+        }
+    }
     close(fd);
 
     /* Pass 2: out-degrees per node, counted inside each part's id range. */
