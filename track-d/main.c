@@ -135,7 +135,7 @@ static int dbits(uint32_t n) {
     return d > 62 ? 62 : d;
 }
 
-static int64_t shortest(uint32_t s, uint32_t t, uint32_t n, const uint32_t *head,
+static int64_t shortest(uint32_t s, uint32_t t, uint32_t n, const uint32_t *__restrict head,
                         const Edge *e, DT *dt, Heap *h) {
     uint32_t cur = dt->epoch + 1;
     if (__builtin_expect(cur >= dt->limit, 0)) { memset(dt->tag, 0, (size_t)n * 4); cur = 1; }
