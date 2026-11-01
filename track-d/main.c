@@ -32,10 +32,14 @@
 
 typedef struct { uint32_t v, w; } Edge;
 typedef struct { uint32_t s, t; int64_t ans; } Query;
-typedef struct { int64_t d; uint32_t u, e; } HN;  /* e = head[u], carried */
+typedef struct { int64_t d; uint32_t u; } HN;      /* radix entry: carries its key */
 
+/* Both frontiers share one shape; `dial` picks the entry size, and the dial
+ * entry needs nothing but an id: every key in the queue lies in [cur, cur + DB),
+ * so a bucket holds exactly one key and the bucket index *is* the key. */
 typedef struct {
-    HN **b; uint32_t *n, *cap, nb, total;
+    void **b; uint32_t *n, *cap, nb, total;
+    uint64_t bm[DB / 64];        /* dial: bucket-occupancy bitmap */
     int64_t last, cur; int dial;
 } Heap;
 
@@ -43,7 +47,7 @@ static void heap_init(Heap *h, int dial) {
     memset(h, 0, sizeof *h);
     h->dial = dial;
     h->nb = dial ? DB : RB;
-    h->b = calloc(h->nb, sizeof(HN *));
+    h->b = calloc(h->nb, sizeof(void *));
     h->n = calloc(h->nb, sizeof(uint32_t));
     h->cap = calloc(h->nb, sizeof(uint32_t));
     if (!h->b || !h->n || !h->cap) { fputs("oom\n", stderr); exit(1); }
@@ -54,36 +58,56 @@ static void heap_free(Heap *h) {
 }
 static inline void heap_reset(Heap *h) {
     memset(h->n, 0, (size_t)h->nb * sizeof(uint32_t));
+    memset(h->bm, 0, sizeof h->bm);
     h->total = 0; h->last = 0; h->cur = 0;
+}
+static void heap_grow(Heap *h, uint32_t bi) {
+    uint32_t nc = h->cap[bi] ? h->cap[bi] * 2 : 64;
+    void *nb = realloc(h->b[bi], (size_t)nc * (h->dial ? 4 : sizeof(HN)));
+    if (!nb) { fputs("oom\n", stderr); exit(1); }
+    h->b[bi] = nb; h->cap[bi] = nc;
+}
+static inline void dpush(Heap *h, int64_t k, uint32_t u) {
+    uint32_t bi = (uint32_t)k & (DB - 1), n = h->n[bi];
+    if (__builtin_expect(n == h->cap[bi], 0)) heap_grow(h, bi);
+    if (!n) h->bm[bi >> 6] |= 1ULL << (bi & 63);
+    ((uint32_t *)h->b[bi])[n] = u;
+    h->n[bi] = n + 1; h->total++;
+}
+/* Successive distances are hundreds apart, so scanning empty buckets one at a
+ * time costs more than relaxing a node does: the bitmap jumps over the hole. */
+static uint32_t dnext(Heap *h) {
+    uint32_t ci = (uint32_t)h->cur & (DB - 1), w = ci >> 6;
+    uint64_t m = h->bm[w] & (~0ULL << (ci & 63));
+    while (!m) { w = (w + 1) & (DB / 64 - 1); m = h->bm[w]; }
+    uint32_t idx = w * 64 + (uint32_t)__builtin_ctzll(m);
+    h->cur += (uint32_t)(idx - ci) & (DB - 1);
+    return idx;
+}
+static inline uint32_t dpop(Heap *h) {
+    uint32_t ci = (uint32_t)h->cur & (DB - 1);
+    if (h->n[ci] == 0) ci = dnext(h);
+    h->total--;
+    uint32_t n = --h->n[ci];
+    if (!n) h->bm[ci >> 6] &= ~(1ULL << (ci & 63));
+    return ((uint32_t *)h->b[ci])[n];
 }
 static inline unsigned rbuck(int64_t k, int64_t last) {
     uint64_t x = (uint64_t)(k ^ last);
     return x ? (unsigned)(64 - __builtin_clzll(x)) : 0u;
 }
-static inline void heap_push(Heap *h, int64_t k, uint32_t u, uint32_t e) {
-    unsigned bi = h->dial ? (unsigned)(k & (DB - 1)) : rbuck(k, h->last);
+static inline void rpush(Heap *h, int64_t k, uint32_t u) {
+    unsigned bi = rbuck(k, h->last);
     uint32_t n = h->n[bi];
-    if (__builtin_expect(n == h->cap[bi], 0)) {
-        uint32_t nc = h->cap[bi] ? h->cap[bi] * 2 : 64;
-        HN *nb = (HN *)realloc(h->b[bi], (size_t)nc * sizeof(HN));
-        if (!nb) { fputs("oom\n", stderr); exit(1); }
-        h->b[bi] = nb; h->cap[bi] = nc;
-    }
-    h->b[bi][n].d = k; h->b[bi][n].u = u; h->b[bi][n].e = e;
+    if (__builtin_expect(n == h->cap[bi], 0)) heap_grow(h, bi);
+    ((HN *)h->b[bi])[n].d = k; ((HN *)h->b[bi])[n].u = u;
     h->n[bi] = n + 1; h->total++;
 }
-static inline HN heap_pop(Heap *h) {
-    if (__builtin_expect(h->dial, 1)) {
-        /* All weights are < DB, so every entry in a bucket has the same key and
-         * the next non-empty bucket is simply the first one at or after cur. */
-        while (h->n[h->cur & (DB - 1)] == 0) h->cur++;
-        h->total--;
-        return h->b[h->cur & (DB - 1)][--h->n[h->cur & (DB - 1)]];
-    }
+static inline HN rpop(Heap *h) {
     if (__builtin_expect(h->n[0] == 0, 0)) {
         unsigned i = 1;
         while (h->n[i] == 0) i++;
-        uint32_t cnt = h->n[i], mi = 0; HN *arr = h->b[i];
+        uint32_t cnt = h->n[i], mi = 0; HN *arr = (HN *)h->b[i];
         int64_t m = arr[0].d;
         for (uint32_t k = 1; k < cnt; k++) if (arr[k].d < m) { m = arr[k].d; mi = k; }
         HN ret = arr[mi];
@@ -91,11 +115,11 @@ static inline HN heap_pop(Heap *h) {
         /* Every remaining key differs from m in a bit below i, so these pushes
          * never touch bucket i (whose buffer is arr). */
         for (uint32_t k = 0; k < cnt; k++)
-            if (k != mi) heap_push(h, arr[k].d, arr[k].u, arr[k].e);
+            if (k != mi) rpush(h, arr[k].d, arr[k].u);
         return ret;
     }
     h->total--;
-    return h->b[0][--h->n[0]];
+    return ((HN *)h->b[0])[--h->n[0]];
 }
 
 /* 24-bit distance + 8-bit generation stamp in one word: "seen in this query?"
@@ -121,30 +145,26 @@ static int64_t shortest(uint32_t s, uint32_t t, uint32_t n, const uint32_t *head
     uint32_t *tag = dt->tag;
     heap_reset(h);
     tag[s] = stamp;
-    heap_push(h, 0, s, head[s]);
+    dpush(h, 0, s);
     int dropped = 0;
     while (h->total) {
-        HN top = heap_pop(h);
-        int64_t d = top.d;
-        uint32_t u = top.u, ee = top.e, e_end = head[u + 1];
-        if (__builtin_expect((tag[u] & mask) != (uint32_t)d, 0)) continue;  /* stale */
+        uint32_t u = dpop(h), d = (uint32_t)h->cur;   /* the bucket index is the key */
+        uint32_t ee = head[u], e_end = head[u + 1];
+        if (__builtin_expect((tag[u] & mask) != d, 0)) continue;  /* stale */
         if (u == t) return d;
         for (; ee < e_end; ee++) {
             if (PF && ee + PF < e_end) __builtin_prefetch(&tag[e[ee + PF].v], 1, 3);
-            uint32_t v = e[ee].v;
-            int64_t nd = d + (int64_t)e[ee].w;
+            uint32_t v = e[ee].v, w = e[ee].w;
             /* A candidate at or above FLIM cannot lie on a path shorter than
-             * FLIM, so dropping it keeps every distance below FLIM exact. */
-            if (__builtin_expect(nd >= FLIM, 0)) { dropped = 1; continue; }
+             * FLIM, so dropping it keeps every distance below FLIM exact. The
+             * unsigned compare also catches d + w overflowing 32 bits. */
+            if (__builtin_expect(w >= (uint32_t)(FLIM - d), 0)) { dropped = 1; continue; }
+            uint32_t nd = d + w;
             uint32_t x = tag[v];
-            if ((x >> FB) != cur) {
-                tag[v] = stamp | (uint32_t)nd;
+            if ((x >> FB) != cur || nd < (x & mask)) {
+                tag[v] = stamp | nd;
                 __builtin_prefetch(&head[v], 0, 3);
-                heap_push(h, nd, v, head[v]);
-            } else if (nd < (int64_t)(x & mask)) {
-                tag[v] = stamp | (uint32_t)nd;
-                __builtin_prefetch(&head[v], 0, 3);
-                heap_push(h, nd, v, head[v]);
+                dpush(h, nd, v);
             }
         }
     }
@@ -163,11 +183,11 @@ static int64_t shortest_wide(uint32_t s, uint32_t t, uint32_t n, const uint32_t 
     uint64_t *tag = dt->tag;
     heap_reset(h);
     tag[s] = stamp;
-    heap_push(h, 0, s, head[s]);
+    rpush(h, 0, s);
     while (h->total) {
-        HN top = heap_pop(h);
+        HN top = rpop(h);
         int64_t d = top.d;
-        uint32_t u = top.u, ee = top.e, e_end = head[u + 1];
+        uint32_t u = top.u, ee = head[u], e_end = head[u + 1];
         if (__builtin_expect((int64_t)(tag[u] & mask) != d, 0)) continue;
         if (u == t) return d;
         for (; ee < e_end; ee++) {
@@ -175,12 +195,9 @@ static int64_t shortest_wide(uint32_t s, uint32_t t, uint32_t n, const uint32_t 
             uint32_t v = e[ee].v;
             int64_t nd = d + (int64_t)e[ee].w;
             uint64_t x = tag[v];
-            if ((x >> sh) != cur) {
+            if ((x >> sh) != cur || nd < (int64_t)(x & mask)) {
                 tag[v] = stamp | (uint64_t)nd;
-                heap_push(h, nd, v, head[v]);
-            } else if (nd < (int64_t)(x & mask)) {
-                tag[v] = stamp | (uint64_t)nd;
-                heap_push(h, nd, v, head[v]);
+                rpush(h, nd, v);
             }
         }
     }
@@ -225,7 +242,7 @@ static void *worker(void *arg) {
     dt.limit = 1u << (32 - FB);
     if (!dt.tag) { fputs("oom\n", stderr); exit(1); }
     Heap h, wh;
-    heap_init(&h, c->dial);
+    heap_init(&h, 1);
     heap_init(&wh, 0);   /* the wide search keeps the radix heap: huge keys */
     for (;;) {
         int q = atomic_fetch_add_explicit(&gq, 1, memory_order_relaxed);
@@ -234,6 +251,7 @@ static void *worker(void *arg) {
         int64_t ans;
         if (s == t) ans = 0;
         else if (s >= c->n || t >= c->n) ans = -1;
+        else if (!c->dial) ans = shortest_whole(s, t, c, &wh);
         else if ((c->has_in[t >> 6] & (1ULL << (t & 63))) == 0) ans = -1;
         else if (c->head[s] == c->head[s + 1]) ans = -1;
         else {

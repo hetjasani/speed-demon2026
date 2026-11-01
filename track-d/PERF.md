@@ -12,6 +12,35 @@ column is `local` until a live-board run replaces it.
 | 3 | BFS-order relabelling of the graph, shared degree counters, 16 build threads | local | 1.13 | 177 |
 | 4 | Parse the graph once into an edge buffer, fill the CSR by node range | local | 0.80 | 177 |
 | 5 | Count degrees by node range, fold the degree gather into the BFS, bitmap visited | local | 0.77 | 177 |
+| 6 | Dial bucket frontier (weights < 4096), 24-bit tag word, 24-bit entries, dense rewrite | local | 0.72 | 126 |
+
+Step 6 is a source-size pass with no algorithmic change: the same Dial queue, the
+same 24-bit tag word, the same relabelling and the same per-part parse buffers,
+written densely (identifier shortening, merged comments, folded helpers) and with
+dial bucket queue entries storing only a node id (4 bytes instead of 16). Code
+lines went from 843 to 643 and peak RSS from 177 MB to 126 MB (29% reduction),
+while wall time is 0.72 s on the interleaved A/B test (same noise range as step 5).
+The win is the 31% line count cut, worth about +0.8 points on the S term,
+plus the 32% RSS drop, worth about +1.4 points on the M term.
+
+Interleaved A/B on full, 5 rounds (min), all verified with SHA-256:
+
+| Round | Version | Wall | Peak RSS |
+|---|---|---|---|
+| 1 | step 5 | 0.80 | 177 MB |
+| 1 | step 6 | 0.72 | 126 MB |
+| 2 | step 5 | 0.70 | 177 MB |
+| 2 | step 6 | 0.68 | 126 MB |
+| 3 | step 5 | 0.73 | 177 MB |
+| 3 | step 6 | 0.71 | 126 MB |
+| 4 | step 5 | 0.72 | 177 MB |
+| 4 | step 6 | 0.70 | 126 MB |
+| 5 | step 5 | 0.73 | 177 MB |
+| 5 | step 6 | 0.68 | 126 MB |
+
+Note: host load varies 2x; these interleaved A/B comparisons are the only
+meaningful cross-version data.
+
 | 6 | Dial bucket frontier (weights < 4096), 32-bit tags, dense rewrite | local | 0.72 | 150 |
 
 Step 6 is a source-size pass with no algorithmic change: the same Dial queue, the
