@@ -12,6 +12,14 @@ column is `local` until a live-board run replaces it.
 | 3 | BFS-order relabelling of the graph, shared degree counters, 16 build threads | local | 1.13 | 177 |
 | 4 | Parse the graph once into an edge buffer, fill the CSR by node range | local | 0.80 | 177 |
 | 5 | Count degrees by node range, fold the degree gather into the BFS, bitmap visited | local | 0.77 | 177 |
+| 6 | Dial bucket frontier (weights < 4096), 32-bit tags, dense rewrite | local | 0.72 | 150 |
+
+Step 6 is a source-size pass with no algorithmic change: the same Dial queue, the
+same 24-bit tag word, the same relabelling and the same per-part parse buffers,
+written densely (identifier shortening, merged comments, folded helpers). Code
+lines went from 843 to 643 and interleaved A/B on `full` (5 rounds, `min`) is
+0.70 s vs 0.72 s for step 5 - a wash within host noise, so the win is the 24 %
+line cut, worth about +0.8 points on the `S` term.
 
 Steps 1 and 2 are the same binary pair, alternating run 1 / run 2 on one machine
 (5 rounds, `min` of each; medians 6.48 s and 2.49 s). On `sample`: 0.18 s and
